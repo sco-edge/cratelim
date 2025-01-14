@@ -1,0 +1,147 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: rate-scanning1
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        portNumber: 5000
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value: 
+       name: envoy.lua
+       typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+          default_source_code:
+            inline_string: |
+              function envoy_on_request(request_handle)
+                local path = request_handle:headers():get(":path") or "no-path"
+                local api_context = request_handle:headers():get("api-context") or "no-api"
+                local progress_context = request_handle:headers():get("progress-context") or "no-progress"
+                request_handle:logInfo("I REQ " .. path .. " " .. api_context .. " " .. progress_context)
+              end
+              function envoy_on_response(response_handle)
+                local status = response_handle:headers():get(":status") or "no-status"
+                local api_context = response_handle:headers():get("api-context") or "no-api"
+                local progress_context = response_handle:headers():get("progress-context") or "no-progress"
+                response_handle:logInfo("I RES " .. status .. " " .. api_context .. " " .. progress_context)
+              end
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: rate-scanning2
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER 
+    match:
+      context: SIDECAR_OUTBOUND
+      listener:
+        portNumber: 8081
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value: 
+       name: envoy.lua
+       typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+          default_source_code:
+            inline_string: |
+              function envoy_on_request(request_handle)
+                local path = request_handle:headers():get(":path") or "no-path"
+                local api_context = request_handle:headers():get("api-context") or "no-api"
+                local progress_context = request_handle:headers():get("progress-context") or "no-progress"
+                request_handle:logInfo("O REQ " .. path .. " " .. api_context .. " " .. progress_context)
+              end
+              function envoy_on_response(response_handle)
+                local status = response_handle:headers():get(":status") or "no-status"
+                local api_context = response_handle:headers():get("api-context") or "no-api"
+                local progress_context = response_handle:headers():get("progress-context") or "no-progress"
+                response_handle:logInfo("O RES " .. status .. " " .. api_context .. " " .. progress_context)
+              end
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: rate-scanning3
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER 
+    match:
+      context: SIDECAR_OUTBOUND
+      listener:
+        portNumber: 8082
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value: 
+       name: envoy.lua
+       typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+          default_source_code:
+            inline_string: |
+              function envoy_on_request(request_handle)
+                local path = request_handle:headers():get(":path") or "no-path"
+                local api_context = request_handle:headers():get("api-context") or "no-api"
+                local progress_context = request_handle:headers():get("progress-context") or "no-progress"
+                request_handle:logInfo("O REQ " .. path .. " " .. api_context .. " " .. progress_context)
+              end
+              function envoy_on_response(response_handle)
+                local status = response_handle:headers():get(":status") or "no-status"
+                local api_context = response_handle:headers():get("api-context") or "no-api"
+                local progress_context = response_handle:headers():get("progress-context") or "no-progress"
+                response_handle:logInfo("O RES " .. status .. " " .. api_context .. " " .. progress_context)
+              end
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: rate-scanning4
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER 
+    match:
+      context: SIDECAR_OUTBOUND
+      listener:
+        portNumber: 8087
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value: 
+       name: envoy.lua
+       typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+          default_source_code:
+            inline_string: |
+              function envoy_on_request(request_handle)
+                local path = request_handle:headers():get(":path") or "no-path"
+                local api_context = request_handle:headers():get("api-context") or "no-api"
+                local progress_context = request_handle:headers():get("progress-context") or "no-progress"
+                request_handle:logInfo("O REQ " .. path .. " " .. api_context .. " " .. progress_context)
+              end
+              function envoy_on_response(response_handle)
+                local status = response_handle:headers():get(":status") or "no-status"
+                local api_context = response_handle:headers():get("api-context") or "no-api"
+                local progress_context = response_handle:headers():get("progress-context") or "no-progress"
+                response_handle:logInfo("O RES " .. status .. " " .. api_context .. " " .. progress_context)
+              end

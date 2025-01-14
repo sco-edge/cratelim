@@ -1,0 +1,86 @@
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: catalog-ratelimit-filter
+spec:
+  workloadSelector:
+    labels:
+      app: frontend
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        portNumber: 5000
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.ratelimit
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+
+          domain: catalog-ratelimit
+          failure_mode_deny: true
+          rate_limit_service:
+            grpc_service:
+              envoy_grpc:
+                cluster_name: outbound|8081||ratelimit.istioinaction.svc.cluster.local
+              timeout: 10s
+            transport_api_version: V3
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: catalog-ratelimit-actions
+spec:
+  workloadSelector:
+    labels:
+      app: frontend
+  configPatches:
+    - applyTo: VIRTUAL_HOST
+      match:
+        context: SIDECAR_INBOUND
+        routeConfiguration:
+          vhost:
+            route:
+              action: ANY
+      patch:
+        operation: MERGE
+        # Applies the rate limit rules.
+        value:
+          rate_limits:
+            # - actions:
+            #   - header_value_match:
+            #       descriptor_value: no_loyalty
+            #       expect_match: false
+            #       headers:
+            #       - name: "x-loyalty"
+            - actions:
+              - header_value_match:
+                  descriptor_value: bronze_request
+                  headers:
+                  - name: "x-loyalty"
+                    exact_match: bronze
+            - actions:
+              - header_value_match:
+                  descriptor_value: silver_request
+                  headers:
+                  - name: "x-loyalty"
+                    exact_match: silver
+            - actions:
+              - header_value_match:
+                  descriptor_value: gold_request
+                  headers:
+                  - name: "x-loyalty"
+                    exact_match: gold
+            - actions:
+              - header_value_match:
+                  descriptor_value: blocked
+                  headers:
+                  - name: "api-context"
+                    exact_match: blocked
