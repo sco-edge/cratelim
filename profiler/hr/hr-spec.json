@@ -1,0 +1,116 @@
+{
+    "app": "hr",
+    "microservices": [
+        {
+            "id": "frontend",
+            "gateway": true,
+            "port": 80,
+            "apis": [
+                {
+                    "id": "hotels",
+                    "type": "http",
+                    "params": [
+                        {
+                            "key": "inDate",
+                            "value": "2015-04-23",
+                            "type": "string"
+                        },
+                        {
+                            "key": "outDate",
+                            "value": "2015-04-25",
+                            "type": "string"
+                        },
+                        {
+                            "key": "lat",
+                            "value": "37.8000",
+                            "type": "float"
+                        },
+                        {
+                            "key": "lon",
+                            "value": "-122.4000",
+                            "type": "float"
+                        }
+                    ],
+                    "spans": [
+                        "init",
+                        "near-by",
+                        "check-availability",
+                        "get-profiles"
+                    ]
+                },
+                {
+                    "id": "recommendation"
+                }
+                
+            ]
+        },
+        {
+            "id": "search",
+            "gateway": false,
+            "port": 8082,
+            "apis": [
+                {
+                    "id": "nearby",
+                    "type": "grpc",
+                    "params": [
+                        {
+                            "key": "lat",
+                            "value": "37.8000",
+                            "type": "float"
+                        },
+                        {
+                            "key": "lon",
+                            "value": "-122.4000",
+                            "type": "float"
+                        },
+                        {
+                            "key": "inDate",
+                            "value": "2015-04-23",
+                            "type": "string"
+                        },
+                        {
+                            "key": "outDate",
+                            "value": "2015-04-25",
+                            "type": "string"
+                        }
+                    ],
+                    "spans": [
+                        "init",
+                        "near-by",
+                        "get-rates"
+                    ]
+                }
+            ]
+        }
+    ],
+    "eapis": [
+        {
+            "id": "hotels",
+            "iapis": [
+                "search:nearby",
+                "reservation:check-availability",
+                "profile:get-profile"
+            ]
+        },
+        {
+            "id": "recommendations",
+            "iapis": [
+                "recommendation:get-recommendations",
+                "profile:get-profile"
+            ]
+        },
+        {
+            "id": "user",
+            "iapis": [
+                "user:check-user"
+            ]
+        },
+        {
+            "id": "restaurants",
+            "iapis": [
+                "user:check-user",
+                "profile:get-profile"
+            ]
+        }
+    ]
+}
