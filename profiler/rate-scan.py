@@ -1,5 +1,7 @@
 #!/bin/python3
 import re
+import os
+import sys
 import time
 import json
 import logging
@@ -8,6 +10,24 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as mp
 from datetime import datetime
+
+def get_spans_dependencies(target_app, target_microservice, target_api):
+    with open(f'../../{target_app}/{target_app}-spec.json', 'r') as file:
+        data = json.load(file)
+        
+    if not target_app == data.get("app"):
+        logging.error("application ids are different.")
+
+    print(target_app, target_microservice, target_api)
+    microservices = data.get("microservices", [])
+    for microservice in microservices:
+        if microservice.get("id") == target_microservice:
+            apis = microservice.get("apis", [])
+            for api in apis:  
+                if api.get("id") == target_api:
+                    return api.get("spans"), api.get("dependencies")
+
+    logging.error("no such api")
 
 def parse_response_times(data):
     # Extract response_times from JSON
@@ -45,30 +65,8 @@ def parse_response_times(data):
         }
     }
 
-def is_arrival(parsed_line):
-    arrival_conditions = [
-        ('I', 'REQ', 'no-progress'),
-        ('O', 'RES', 'near-by'),
-        ('O', 'RES', 'check-availability'),
-        ('O', 'RES', 'get-profiles'),
-    ]
-    return (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) in arrival_conditions
-
-def calculate_backlog(data, backlogs, max_backlogs, parsed_line):
-    arrival_conditions = [
-        ('I', 'REQ', 'no-progress'),
-        ('O', 'RES', 'near-by'),
-        ('O', 'RES', 'check-availability'),
-        ('O', 'RES', 'get-profiles'),
-    ]
-    departure_conditions = [
-        ('O', 'REQ', 'near-by'),
-        ('O', 'REQ', 'check-availability'),
-        ('O', 'REQ', 'get-profiles'),
-        ('I', 'RES', 'no-progress'),
-    ]
-
-    for i, condition in enumerate(arrival_conditions):
+def calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, parsed_line):
+    for i, condition in enumerate(arrivals):
         if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
             backlogs[0] += 1
             backlogs[i+1] += 1
@@ -78,7 +76,7 @@ def calculate_backlog(data, backlogs, max_backlogs, parsed_line):
             if backlogs[0] > max_backlogs[0]:
                 max_backlogs[0] = backlogs[0]
             
-    for i, condition in enumerate(departure_conditions):
+    for i, condition in enumerate(departures):
         if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
             backlogs[0] -= 1
             backlogs[i+1] -= 1
@@ -100,22 +98,18 @@ def parse_log_line(log_line):
         return match.groupdict()
     return None
 
-def plot(data, file_name):
+def plot(data, file_name, len_span):
     timestamps = [datetime.fromisoformat(item[0][:23]) for item in data]
     values = [item[1] for item in data]
 
-    col1 = [v[0] for v in values]
-    col2 = [v[1] for v in values]
-    col3 = [v[2] for v in values]
-    col4 = [v[3] for v in values]
-    col5 = [v[4] for v in values]
-
     mp.figure(figsize=(12, 6))
-    mp.plot(timestamps, col1, label='Total')
-    mp.plot(timestamps, col2, label='1')
-    mp.plot(timestamps, col3, label='2')
-    mp.plot(timestamps, col4, label='3')
-    mp.plot(timestamps, col5, label='4')
+
+    total_col = [v[0] for v in values]
+    mp.plot(timestamps, total_col, label='Total')
+
+    for i in range(len_span):
+        col = [v[i+1] for v in values]
+        mp.plot(timestamps, col, label=i+1)
 
     mp.xlabel('Time')
     mp.ylabel('Backlogs')
@@ -129,18 +123,19 @@ def plot(data, file_name):
     # end_time = datetime.fromisoformat("2025-01-12T13:08:33.643984571Z"[:23])
     # mp.xlim(left=start_time, right=end_time)
 
-    output_path = f"output/{file_name}.png"
+    output_path = f"{file_name}.png"
     mp.savefig(output_path, dpi=300, bbox_inches='tight')
+    mp.close()
 
-def parse_log(results, logs):
+def parse_log(arrivals, departures, results, logs):
     for log in logs:
         # max_backlog = 0
         # backlog = 0
         data = []
-        backlogs = [0] * 5
-        max_backlogs = [0] * 5
+        backlogs = [0] * (len(arrivals) + 1)
+        max_backlogs = [0] * (len(arrivals) + 1)
 
-        with open(f"output/{log}", 'r') as file:
+        with open(f"{log}", 'r') as file:
             for line in file:
                 parsed_line = parse_log_line(line.strip())
                 if parsed_line:
@@ -150,11 +145,11 @@ def parse_log(results, logs):
                     #     backlog -= 1
                     # if backlog > max_backlog:
                     #     max_backlog = backlog
-                    calculate_backlog(data, backlogs, max_backlogs, parsed_line)
+                    calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, parsed_line)
 
         # for datum in data:
         #     print(datum)
-        plot(data, log)
+        plot(data, log, len(arrivals))
         results['max_backlogs'] = max_backlogs
         # print(f'{log} max backlog: {max_backlogs}')
 
@@ -189,12 +184,14 @@ def run_constant_interval(rps, duration, app, microservice, api):
     ]
 
     try:
-        result = subprocess.run(command, check=True, text=True, capture_output=True, cwd=app)
+        result = subprocess.run(command, check=True, text=True, capture_output=True, cwd=os.path.join("../..", app))
         logging.info("Load script execution completed successfully.")
-        logging.debug(result.stdout)
+        responses = result.stdout
     except subprocess.CalledProcessError as e:
         logging.error("Load script execution failed:")
         logging.error(e.stderr)
+    
+    return responses.split()
 
 def run_locust(rps):
     # if rps < 10:
@@ -228,9 +225,8 @@ def run_locust(rps):
         logging.error("Locust execution failed:")
         logging.error(e.stderr)
 
-def init_pods():
+def init_pods(microservice, dependencies):
     try:
-        # Step 1: Get all pods and delete 'frontend' pods
         logging.info("Fetching all pods...")
         result = subprocess.run(
             ["kubectl", "get", "pods", "-A"],
@@ -239,24 +235,25 @@ def init_pods():
             capture_output=True
         )
 
-        # Parse output to find 'frontend' pods
         logging.info("Parsing pod information...")
         output_lines = result.stdout.splitlines()
-        frontend_pods = []
-        for line in output_lines[1:]:  # Skip the header
+        target_pods = []
+        for line in output_lines[1:]:
             parts = line.split()
-            if len(parts) > 1 and parts[1].startswith("frontend"):
-                namespace = parts[0]  # Namespace
-                pod_name = parts[1]  # Pod name
-                frontend_pods.append((namespace, pod_name))
+            if len(parts) > 1 and (
+                parts[1].startswith(microservice) or
+                any(parts[1].startswith(dependency) for dependency in dependencies)
+            ):
+                namespace = parts[0]
+                pod_name = parts[1]
+                target_pods.append((namespace, pod_name))
 
-        if not frontend_pods:
-            logging.error("No 'frontend' pods found.")
+        if not target_pods:
+            logging.error(f"No '{microservice}' pods found.")
             return
 
-        # Delete 'frontend' pods
-        logging.info(f"Found {len(frontend_pods)} 'frontend' pods: {[pod for _, pod in frontend_pods]}")
-        for namespace, pod_name in frontend_pods:
+        logging.info(f"Found {len(target_pods)} '{microservice}' and its dependencies {dependencies} pods")
+        for namespace, pod_name in target_pods:
             try:
                 logging.info(f"Deleting pod: {pod_name} in namespace: {namespace}")
                 subprocess.run(
@@ -270,9 +267,8 @@ def init_pods():
                 logging.error(f"Failed to delete pod: {pod_name}")
                 logging.error(e.stderr)
 
-        # Step 2: Check for recreated pods in a loop
-        max_retries = 10  # Maximum number of checks
-        interval = 2  # Seconds between checks
+        max_retries = 10
+        interval = 1
         retries = 0
 
         while retries < max_retries:
@@ -285,12 +281,12 @@ def init_pods():
             )
             output_lines = result.stdout.splitlines()
             recreated_pods = []
-            for line in output_lines[1:]:  # Skip the header
+            for line in output_lines[1:]:
                 parts = line.split()
                 if (
-                    len(parts) > 3 and  # Ensure there are enough parts in the line
-                    parts[1].startswith("frontend") and  # Pod name starts with 'frontend'
-                    parts[3] == "Running"  # STATUS column is 'Running'
+                    len(parts) > 3 and
+                    parts[1].startswith(microservice) and
+                    parts[3] == "Running"
                 ):
                     result = subprocess.run(
                         ["istioctl", "proxy-config", "log", f"{parts[1]}.default", "--level", "lua=info"],
@@ -302,27 +298,29 @@ def init_pods():
                     return recreated_pods
 
             if recreated_pods:
-                logging.info(f"Recreated 'frontend' pods: {recreated_pods}")
-                return  # Exit the function when pods are recreated
+                logging.info(f"Recreated '{microservice}' pods: {recreated_pods}")
+                return
 
-            logging.warning(f"No 'frontend' pods recreated yet. Retrying in {interval} seconds...")
+            logging.warning(f"No '{microservice}' pods recreated yet. Retrying in {interval} seconds...")
             retries += 1
             time.sleep(interval)
 
-        logging.error("Timeout reached. No 'frontend' pods were recreated.")
+        logging.error(f"Timeout reached. No '{microservice}' pods were recreated.")
 
     except subprocess.CalledProcessError as e:
         logging.error("An error occurred while executing kubectl commands.")
         logging.error(e.stderr)
 
-def gen_log(pods, run):
+def gen_log(pods, rate):
+    global run
+
     i = 0
     log_files = []
     for pod in pods:
-        log_file = f"tmp.{run}.{i}.log"
+        log_file = f"{run}.{rate}.{i}.log"
         command = ["kubectl", "logs", pod, "-c", "istio-proxy"]
 
-        with open(f"output/{log_file}", "w") as f:
+        with open(f"{log_file}", "w") as f:
             subprocess.run(command, check=True, text=True, stdout=f)
         
         i += 1
@@ -331,6 +329,9 @@ def gen_log(pods, run):
     return log_files
 
 def generate_tikz_curve(coefficients):
+    # We skip the first (total) backlog
+    dimension = len(coefficients[0][1]) - 1
+    line_segments = [[] for _ in range(dimension)]
     tikz_code = """
 \\documentclass{article}
 \\usepackage[active,tightpage]{preview}
@@ -353,33 +354,231 @@ def generate_tikz_curve(coefficients):
 """
 
     # Add each function to the plot
-    for i, (slope, intercept) in enumerate(coefficients):
-        color = ["blue", "red", "green", "orange", "purple", "cyan"]
-        tikz_code += f"\\addplot[{color[i % len(color)]}, dashed, thick] {{{slope}*x - {intercept}}};\n"
+    for (slope, intercepts) in coefficients:
+        for i, intercept in enumerate(intercepts[1:]):
+            tikz_code += f"\\addplot[blue, dashed] {{{slope}*x - {intercept}}};\n"
+            line_segments[i].append((slope, intercept))
     
-    max_expression = "max(" + ", ".join([f"{slope}*x - {intercept}" for slope, intercept in coefficients]) + ")"
-    tikz_code += f"\\addplot[black, thick] {{{max_expression}}};\n"
+    for i in range(dimension):
+        max_expression = "max(" + ", ".join([f"{slope}*x - {intercept}" for slope, intercept in line_segments[i]]) + ")"
+        tikz_code += f"\\addplot[black, thick] {{{max_expression}}};\n"
     tikz_code += "\\end{axis}\n\\end{tikzpicture}\n\\end{preview}\n\\end{document}"
             
     return tikz_code
 
 def plog_tikz_image(coefficients):
-    file_path = "output/curve.tex"
+    global run
+    file_path = f"{run}.curve.tex"
     tikz_code = generate_tikz_curve(coefficients)
     with open(file_path, 'w') as file:
         file.write(tikz_code)
 
     try:
-        subprocess.run(["pdflatex", "-output-directory=output", file_path], check=True)
-        print(f"Compilation successful. PDF generated for {file_path}.")
+        subprocess.run(["pdflatex", file_path], check=True,
+                       stdin=subprocess.PIPE,
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        logging.info(f"Compilation successful. PDF generated for {file_path}.")
     except subprocess.CalledProcessError as e:
-        print(f"Error during compilation: {e}")
+        logging.error(f"Error during compilation: {e}")
     except FileNotFoundError:
-        print("pdflatex not found. Make sure it is installed and in your PATH.")
+        logging.error("pdflatex not found. Make sure it is installed and in your PATH.")
+
+def clear_envoyfilter():
+    try:
+        logging.info(f"Clear envoyfilters")
+        result = subprocess.run(
+            ["kubectl", "get", "envoyfilter"],
+            text=True,
+            capture_output=True,
+            check=True
+        )
+        output_lines = result.stdout.splitlines()
+        target_envoyfilters = []
+        for line in output_lines[1:]:
+            parts = line.split()
+            if len(parts) > 1:
+                target_envoyfilters.append(parts[0])
+
+        logging.info(f"Found {len(target_envoyfilters)} filters")
+        for envoyfilter in target_envoyfilters:
+            try:
+                logging.info(f"Deleting {envoyfilter}")
+                subprocess.run(
+                    ["kubectl", "delete", "envoyfilter", envoyfilter],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.DEVNULL
+                )
+                logging.info(f"Successfully deleted envoyfilter: {envoyfilter}")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to delete envoyfilter: {envoyfilter}")
+                logging.error(e.stderr)
+
+    except subprocess.CalledProcessError as e:
+        logging.error(e.stderr)
+
+def apply_envoyfilter(target_app, target_microservice, target_api):
+    spans = None
+    with open(f'../../{target_app}/{target_app}-spec.json', 'r') as file:
+        data = json.load(file)
+        
+    if not target_app == data.get("app"):
+        logging.error("application ids are different.")
+
+    microservices = data.get("microservices", [])
+    for microservice in microservices:
+        if microservice.get("id") == target_microservice:
+            apis = microservice.get("apis", [])
+            for api in apis:  
+                if api.get("id") == target_api:
+                    if microservice.get("gateway") == True:
+                        port = 5000
+                    else:
+                        port = microservice.get("port")
+                    spans = api.get("spans")
+
+    if port is None or spans is None:
+        raise ValueError(f"Unsupported target: microservice: {target_microservice} api: {target_api}")
+
+    inbound_envoyfilter = f"""
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: rs.{target_app}.{target_microservice}.{target_api}.inbound
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        portNumber: {port}
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value: 
+       name: envoy.lua
+       typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+          default_source_code:
+            inline_string: |
+              function envoy_on_request(request_handle)
+                local path = request_handle:headers():get(":path") or "no-path"
+                local api_context = request_handle:headers():get("api-context") or "no-api"
+                local progress_context = request_handle:headers():get("progress-context") or "no-progress"
+                request_handle:logInfo("I REQ " .. path .. " " .. api_context .. " " .. progress_context)
+              end
+              function envoy_on_response(response_handle)
+                local status = response_handle:headers():get(":status") or "no-status"
+                local api_context = response_handle:headers():get("api-context") or "no-api"
+                local progress_context = response_handle:headers():get("progress-context") or "no-progress"
+                response_handle:logInfo("I RES " .. status .. " " .. api_context .. " " .. progress_context)
+              end
+"""
+    try:
+        logging.info(f"Apply envoyfilter: rs.{target_app}.{target_microservice}.{target_api}.inbound")
+        subprocess.run(
+            ["kubectl", "apply", "-f", "-"],
+            input=inbound_envoyfilter,
+            text=True,
+            capture_output=True,
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        logging.error(e.stderr)
+    
+    for span in spans:
+        for microservice in microservices:
+            if microservice.get("id") == span["microservice"]:
+                apis = microservice.get("apis", [])
+                for api in apis:  
+                    if api.get("id") == span["api"]:
+                        if microservice.get("gateway") == True:
+                            span["port"] = 5000
+                        else:
+                            span["port"] = microservice.get("port")
+
+
+    for span in spans:
+        outbound_envoyfilter = f"""
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: rs.{target_app}.{target_microservice}.{target_api}.{span["microservice"]}.{span["api"]}
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_OUTBOUND
+      listener:
+        portNumber: {span["port"]}
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value: 
+       name: envoy.lua
+       typed_config:
+          "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua"
+          default_source_code:
+            inline_string: |
+              function envoy_on_request(request_handle)
+                local path = request_handle:headers():get(":path") or "no-path"
+                local api_context = request_handle:headers():get("api-context") or "no-api"
+                local progress_context = request_handle:headers():get("progress-context") or "no-progress"
+                request_handle:logInfo("O REQ " .. path .. " " .. api_context .. " " .. progress_context)
+              end
+              function envoy_on_response(response_handle)
+                local status = response_handle:headers():get(":status") or "no-status"
+                local api_context = response_handle:headers():get("api-context") or "no-api"
+                local progress_context = response_handle:headers():get("progress-context") or "no-progress"
+                response_handle:logInfo("O RES " .. status .. " " .. api_context .. " " .. progress_context)
+              end
+"""
+        try:
+            logging.info(f'Apply envoyfilter: rs.{target_app}.{target_microservice}.{target_api}.{span["microservice"]}.{span["api"]}')
+            subprocess.run(
+                ["kubectl", "apply", "-f", "-"],
+                input=outbound_envoyfilter,
+                text=True,
+                capture_output=True,
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            logging.error(e.stderr)
+
+def init_experiment_path():
+    global run
+
+    cwd = os.getcwd()
+    if not os.path.exists(os.path.join(cwd, 'output')):
+        os.mkdir(os.path.join(cwd, 'output'))
+    os.chdir(os.path.join(cwd, 'output'))
+
+    while os.path.exists(os.path.join(cwd, 'output', run)):
+        (remained, last) = run.rsplit("-", 1)
+        trial = int(last) + 1
+        run = f"{remained}-{trial:04}"
+
+    os.mkdir(os.path.join(cwd, 'output', run))
+    os.chdir(os.path.join(cwd, 'output', run))
 
 if __name__ == "__main__":
+    run = f"run-0000"
+    init_experiment_path()
+    print(run)
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--file', '-f', default="0.log")
+    parser.add_argument('--app', '-a')
+    parser.add_argument('--microservice', '-m')
+    parser.add_argument('--api', '-i')
     parser.add_argument('--log', '-l', default="warning")
 
     global args
@@ -399,22 +598,71 @@ if __name__ == "__main__":
         print(f"{args.log} is not an available log level. Available: critical, error, warning, info, debug")
         exit()
     
-    coeffs = []
-    rates = [100, 200]
-    for rate in rates:
-        for run in range(1):
-            pods = init_pods()
-            run_constant_interval(rate, 3, "hr", "search", "nearby")
-            # run_wrk2(rate)
-            results = {}
-            # results = run_locust(rate)
-            logs = gen_log(pods, rate)
-            parse_log(results, logs)
+    spans, dependencies = get_spans_dependencies(args.app, args.microservice, args.api)
 
-            # print(f'rate: {rate} avg: {results["average"]:.3f} p50: {results["p50"]:.3f} '
-            #       f'p90: {results["p90"]:.3f} p99: {results["p99"]:.3f} p99.9: {results["p99.9"]:.3f} '
-            #       f'max_backlogs: {results["max_backlogs"]}')
-            print(f'rate: {rate} max_backlogs: {results["max_backlogs"]}')
-            coeffs.append((rate, results["max_backlogs"][1]))
+    arrivals = []
+    departures = []
+
+    arrivals.append(('I', 'REQ', 'no-progress'))
+    for span in spans:
+        arrivals.append(('O', 'RES', span["api"]))
+        departures.append(('O', 'REQ', span["api"]))
+    departures.append(('I', 'RES', 'no-progress'))
+
+    # print(arrivals)
+    # print(departures)
+
+    clear_envoyfilter()
+    apply_envoyfilter(args.app, args.microservice, args.api)
+
+    coeffs = []
+    # rates = [2000, 3000]
+    # for rate in rates:
+
+    exponential_growth = True
+    rate = 100
+    step = 100
+    threshold = 1
+
+    while True:
+        pods = init_pods(args.microservice, dependencies)
+        responses = run_constant_interval(rate, 3, args.app, args.microservice, args.api)
+
+        if not responses:
+            logging.error(f"No responses from a constant_interval scan: {rate}")
+            break
+
+        results = {"num_responses": int(responses[0]),
+                   "num_failures": int(responses[1]),
+                   "mean": float(responses[2]),
+                   "p50": float(responses[3]),
+                   "p90": float(responses[4]),
+                   "p99": float(responses[5]),
+                   "p99.9": float(responses[6])
+                }
+        logs = gen_log(pods, rate)
+        parse_log(arrivals, departures, results, logs)
+
+        print(f'{rate} {results["num_responses"]} {results["num_failures"]} {results["mean"]:.3f} {results["p50"]:.3f}',
+                f'{results["p90"]:.3f} {results["p99"]:.3f} {results["p99.9"]:.3f} {results["max_backlogs"]}')
+        coeffs.append((rate, results["max_backlogs"]))
+
+        # If the p99 response time is larger than the threshold or the failure ratio is larger than 0.2,
+        # it stops the exponential growth, and backoffs to the last rate + step size
+        if results["p99"] >= threshold or results["num_failures"] / results["num_responses"] > 0.2:
+            if exponential_growth:
+                exponential_growth = False
+                rate = int(rate / 2 + step)
+            else:
+                break
+        else:
+            if exponential_growth:
+                rate *= 2
+            else:
+                rate += step
+        
+        # Sleep sufficiently (we use the p99.9 response time of the last run) to absorb the queued requests
+        time.sleep(results["p99.9"])
 
     plog_tikz_image(coeffs)
+    clear_envoyfilter()
