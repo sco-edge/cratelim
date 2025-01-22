@@ -4,12 +4,12 @@ import os
 import sys
 import time
 import json
+import datetime
 import logging
 import argparse
 import subprocess
 import numpy as np
 import matplotlib.pyplot as mp
-from datetime import datetime
 
 def get_spans_dependencies(target_app, target_microservice, target_api):
     with open(f'../../{target_app}/{target_app}-spec.json', 'r') as file:
@@ -70,7 +70,7 @@ def calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, parsed
         if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
             backlogs[0] += 1
             backlogs[i+1] += 1
-            data.append((parsed_line['timestamp'], tuple(backlogs)))
+            data.append((parsed_line['second_timestamp'], tuple(backlogs)))
             if backlogs[i+1] > max_backlogs[i+1]:
                 max_backlogs[i+1] = backlogs[i+1]
             if backlogs[0] > max_backlogs[0]:
@@ -80,7 +80,7 @@ def calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, parsed
         if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
             backlogs[0] -= 1
             backlogs[i+1] -= 1
-            data.append((parsed_line['timestamp'], tuple(backlogs)))
+            data.append((parsed_line['second_timestamp'], tuple(backlogs)))
 
 def parse_log_line(log_line):
     log_pattern = (
@@ -99,7 +99,7 @@ def parse_log_line(log_line):
     return None
 
 def plot(data, file_name, len_span):
-    timestamps = [datetime.fromisoformat(item[0][:23]) for item in data]
+    timestamps = [datetime.datetime.fromisoformat(item[0][:23]) for item in data]
     values = [item[1] for item in data]
 
     mp.figure(figsize=(12, 6))
@@ -225,6 +225,30 @@ def run_locust(rps):
         logging.error("Locust execution failed:")
         logging.error(e.stderr)
 
+def enable_lua_logs(microservice):
+    try:
+        logging.info("Fetching all pods...")
+        cmd = ["kubectl", "get", "pods", "-A"]
+        result = subprocess.run(cmd, check=True, text=True, capture_output=True)
+        output_lines = result.stdout.splitlines()
+        for line in output_lines[1:]:
+            parts = line.split()
+            if len(parts) > 3 and parts[1].startswith(microservice):
+                max_retries = 5
+                retries = 0
+                while True:
+                    if parts[3] == "Running":
+                        cmd = ["istioctl", "proxy-config", "log", f"{parts[1]}.default", "--level", "lua=info"]
+                        result = subprocess.run(cmd, check=True, text=True, capture_output=True)
+                        break
+                    else:
+                        retries += 1
+                        time.sleep(1)
+
+    except subprocess.CalledProcessError as e:
+        logging.error("An error occurred while executing kubectl commands.")
+        logging.error(e.stderr)
+
 def init_pods(microservice, dependencies):
     try:
         logging.info("Fetching all pods...")
@@ -295,11 +319,11 @@ def init_pods(microservice, dependencies):
                         capture_output=True
                     )
                     recreated_pods.append(parts[1])
-                    return recreated_pods
 
             if recreated_pods:
                 logging.info(f"Recreated '{microservice}' pods: {recreated_pods}")
-                return
+                time.sleep(5)
+                return recreated_pods
 
             logging.warning(f"No '{microservice}' pods recreated yet. Retrying in {interval} seconds...")
             retries += 1
@@ -328,9 +352,42 @@ def gen_log(pods, rate):
 
     return log_files
 
-def generate_tikz_curve(coefficients):
+def construct_convex_hull(coefficients):
+    def is_internal(l1, l2, l3):
+        # Check if the (l1, l2) intersection is larger than the (l2, l3) intersection
+        return (l1[0] - l2[0]) * (l3[1] - l2[1]) <= (l2[0] - l3[0]) * (l2[1] - l1[1])
+    
+    dimension = len(coefficients[0][1])
+    result = [[] for _ in range(dimension)]
+    line_segments_per_dims = [[(slope, intercepts[i]) for slope, intercepts in coefficients if i < len(intercepts)] for i in range(dimension)]
+    for i, line_segments in enumerate(line_segments_per_dims):
+        hull = []
+        intersections = []
+
+        for line in line_segments:
+            # While the last two lines and the current line make the second-to-last line redundant, remove it
+            while len(hull) >= 2 and is_internal(hull[-2], hull[-1], line):
+                hull.pop()
+                intersections.pop()
+            if hull:
+                s1, c1 = hull[-1]
+                s2, c2 = line
+                x_intersection = (c2 - c1) / (s1 - s2)
+                intersections.append(x_intersection)
+            hull.append(line)
+
+        prev_x = float('-inf')
+        for j in range(len(hull)):
+            s, c = hull[j]
+            x_end = intersections[j] if j < len(intersections) else float('inf')
+            result[i].append((s, c, prev_x, x_end))
+            prev_x = x_end
+    
+        return result
+
+def generate_tikz_curve(rates, backlogs):
     # We skip the first (total) backlog
-    dimension = len(coefficients[0][1]) - 1
+    dimension = len(backlogs) - 1
     line_segments = [[] for _ in range(dimension)]
     tikz_code = """
 \\documentclass{article}
@@ -354,10 +411,10 @@ def generate_tikz_curve(coefficients):
 """
 
     # Add each function to the plot
-    for (slope, intercepts) in coefficients:
-        for i, intercept in enumerate(intercepts[1:]):
-            tikz_code += f"\\addplot[blue, dashed] {{{slope}*x - {intercept}}};\n"
-            line_segments[i].append((slope, intercept))
+    for i, slope in enumerate(rates):
+        for j in range(dimension):
+            tikz_code += f"\\addplot[blue, dashed] {{{slope}*x - {backlogs[j+1][i]}}};\n"
+            line_segments[j].append((slope, backlogs[j+1][i]))
     
     for i in range(dimension):
         max_expression = "max(" + ", ".join([f"{slope}*x - {intercept}" for slope, intercept in line_segments[i]]) + ")"
@@ -366,10 +423,10 @@ def generate_tikz_curve(coefficients):
             
     return tikz_code
 
-def plog_tikz_image(coefficients):
+def plog_tikz_image(rates, backlogs):
     global run
     file_path = f"{run}.curve.tex"
-    tikz_code = generate_tikz_curve(coefficients)
+    tikz_code = generate_tikz_curve(rates, backlogs)
     with open(file_path, 'w') as file:
         file.write(tikz_code)
 
@@ -565,15 +622,54 @@ def init_experiment_path():
     while os.path.exists(os.path.join(cwd, 'output', run)):
         (remained, last) = run.rsplit("-", 1)
         trial = int(last) + 1
-        run = f"{remained}-{trial:04}"
+        run = f"{remained}-{trial:03}"
 
     os.mkdir(os.path.join(cwd, 'output', run))
     os.chdir(os.path.join(cwd, 'output', run))
 
+def parse_loki_log(rate, microservice, arrivals, departures, range_from, range_to):
+    global run
+
+    data = []
+    backlogs = [0] * (len(arrivals) + 1)
+    max_backlogs = [0] * (len(arrivals) + 1)
+    try:        
+        logging.info(f'Parse loki log')
+        cmd = ["logcli", "query", f'{{app="{microservice}"}}',
+               f'--from={range_from}', f'--to={range_to}', '--limit=0', '--forward']
+        with open(f"{run}.{microservice}.{rate}.log", "w") as log_file:
+            result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd="../../..")
+            log_file.write(result.stdout)
+    
+        pattern = (
+            r"^(?P<first_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"
+            r".*?"
+            r"(?P<second_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)"
+            r"\s+info\s+envoy\s+lua.*?script log:\s+"
+            r"(?P<direction>[IO])\s+"
+            r"(?P<type>[A-Z]+)"
+            r"(?:\s+(?P<status>\d{3}))?"
+            r"(?:\s+(?P<path>/[^\s]+))?"
+            r"\s+(?P<api_context>[^\s]+)"
+            r"\s+(?P<progress_context>[^\s]+)"
+            r".*thread=(?P<thread_id>\d+)"
+        )
+
+        with open(f"{run}.{rate}.log", "r") as log_file:
+            for line in log_file:
+                match = re.match(pattern, line)
+                if match:
+                    calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, match.groupdict())
+                    
+        plot(data, f"{run}.{microservice}.{rate}", len(arrivals))
+        return max_backlogs
+
+    except subprocess.CalledProcessError as e:
+        logging.error(e.stderr)
+
 if __name__ == "__main__":
-    run = f"run-0000"
+    run = f"run-000"
     init_experiment_path()
-    print(run)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--app', '-a')
@@ -609,27 +705,27 @@ if __name__ == "__main__":
         departures.append(('O', 'REQ', span["api"]))
     departures.append(('I', 'RES', 'no-progress'))
 
-    # print(arrivals)
-    # print(departures)
-
     clear_envoyfilter()
     apply_envoyfilter(args.app, args.microservice, args.api)
 
-    coeffs = []
-    # rates = [2000, 3000]
-    # for rate in rates:
+    rates = []
+    backlogs = [[] for _ in range(len(spans) + 2)]
 
     exponential_growth = True
-    rate = 100
-    step = 100
+    current_rate = 50
+    step_size = 100
     threshold = 1
 
+    # pods = init_pods(args.microservice, dependencies)
+    enable_lua_logs(args.microservice)
+
     while True:
-        pods = init_pods(args.microservice, dependencies)
-        responses = run_constant_interval(rate, 3, args.app, args.microservice, args.api)
+        range_from = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        responses = run_constant_interval(current_rate, 3, args.app, args.microservice, args.api)
+        range_to = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
         if not responses:
-            logging.error(f"No responses from a constant_interval scan: {rate}")
+            logging.error(f"No responses from a constant_interval scan: {current_rate}")
             break
 
         results = {"num_responses": int(responses[0]),
@@ -640,29 +736,41 @@ if __name__ == "__main__":
                    "p99": float(responses[5]),
                    "p99.9": float(responses[6])
                 }
-        logs = gen_log(pods, rate)
-        parse_log(arrivals, departures, results, logs)
+        
+        results["max_backlogs"] = parse_loki_log(current_rate, args.microservice, arrivals, departures, range_from, range_to)
+        
+        # logs = gen_log(pods, current_rate)
+        # parse_log(arrivals, departures, results, logs)
 
-        print(f'{rate} {results["num_responses"]} {results["num_failures"]} {results["mean"]:.3f} {results["p50"]:.3f}',
-                f'{results["p90"]:.3f} {results["p99"]:.3f} {results["p99.9"]:.3f} {results["max_backlogs"]}')
-        coeffs.append((rate, results["max_backlogs"]))
+        print(f'{current_rate} {results["num_responses"]} {results["num_failures"]} {results["mean"]:.3f}',
+              f'{results["p50"]:.3f} {results["p90"]:.3f} {results["p99"]:.3f} {results["p99.9"]:.3f} {results["max_backlogs"]}')
+        rates.append(current_rate)
+        for i, max_backlog in enumerate(results["max_backlogs"]):
+            backlogs[i].append(results["max_backlogs"][i])
+
+        # if current_rate <= 200:
+        #     current_rate += 100
+        #     continue
+        # else:
+        #     break
 
         # If the p99 response time is larger than the threshold or the failure ratio is larger than 0.2,
         # it stops the exponential growth, and backoffs to the last rate + step size
         if results["p99"] >= threshold or results["num_failures"] / results["num_responses"] > 0.2:
             if exponential_growth:
                 exponential_growth = False
-                rate = int(rate / 2 + step)
+                step_size = int(current_rate / 2 * 0.2)
+                current_rate = int(current_rate / 2 + step_size)
             else:
                 break
         else:
             if exponential_growth:
-                rate *= 2
+                current_rate *= 2
             else:
-                rate += step
+                current_rate += step_size
         
         # Sleep sufficiently (we use the p99.9 response time of the last run) to absorb the queued requests
         time.sleep(results["p99.9"])
 
-    plog_tikz_image(coeffs)
+    plog_tikz_image(rates, backlogs)
     clear_envoyfilter()
