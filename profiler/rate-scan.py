@@ -11,15 +11,19 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as mp
 
-def get_spans_dependencies(target_app, target_microservice, target_api):
-    with open(f'../../{target_app}/{target_app}-spec.json', 'r') as file:
-        data = json.load(file)
-        
-    if not target_app == data.get("app"):
-        logging.error("application ids are different.")
+def get_profiling_targets(spec):
+    targets = []
 
-    print(target_app, target_microservice, target_api)
-    microservices = data.get("microservices", [])
+    microservices = spec.get("microservices", [])
+    for microservice in microservices:
+        apis = microservice.get("apis", [])
+        for api in apis:  
+            targets.append((microservice.get("id"), api.get("id"), microservice.get("gateway") is True))
+
+    return targets
+
+def get_spans_dependencies(spec, target_microservice, target_api):
+    microservices = spec.get("microservices", [])
     for microservice in microservices:
         if microservice.get("id") == target_microservice:
             apis = microservice.get("apis", [])
@@ -27,7 +31,7 @@ def get_spans_dependencies(target_app, target_microservice, target_api):
                 if api.get("id") == target_api:
                     return api.get("spans"), api.get("dependencies")
 
-    logging.error("no such api")
+    logging.error("get_spans_dependencies() failed")
 
 def parse_response_times(data):
     # Extract response_times from JSON
@@ -66,6 +70,7 @@ def parse_response_times(data):
     }
 
 def calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, parsed_line):
+    interval_measured = False
     for i, condition in enumerate(arrivals):
         if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
             backlogs[0] += 1
@@ -75,12 +80,17 @@ def calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, parsed
                 max_backlogs[i+1] = backlogs[i+1]
             if backlogs[0] > max_backlogs[0]:
                 max_backlogs[0] = backlogs[0]
+
+            if parsed_line['direction'] == 'I' and parsed_line['type'] == 'REQ' and parsed_line['progress_context'] == 'no-progress':
+                interval_measured = True
             
     for i, condition in enumerate(departures):
         if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
             backlogs[0] -= 1
             backlogs[i+1] -= 1
             data.append((parsed_line['second_timestamp'], tuple(backlogs)))
+
+    return datetime.datetime.fromisoformat(parsed_line['second_timestamp'].replace("Z", "+00:00")), interval_measured
 
 def parse_log_line(log_line):
     log_pattern = (
@@ -174,17 +184,9 @@ def run_wrk2(rps):
         logging.error(e.stderr)
 
 def run_constant_interval(rps, duration, app, microservice, api):
-    command = [
-        "./constant-interval-hr.py",
-        "--rps", str(rps),
-        "--duration", str(duration),
-        "-a", app,
-        "-m", microservice,
-        "-i", api
-    ]
-
+    command = ["./constant-interval-hr.py", "--rps", str(rps), "--duration", str(duration), "-a", app, "-m", microservice, "-i", api]
     try:
-        result = subprocess.run(command, check=True, text=True, capture_output=True, cwd=os.path.join("../..", app))
+        result = subprocess.run(command, check=True, text=True, capture_output=True, cwd=os.path.join("../../..", app))
         logging.info("Load script execution completed successfully.")
         responses = result.stdout
     except subprocess.CalledProcessError as e:
@@ -228,22 +230,32 @@ def run_locust(rps):
 def enable_lua_logs(microservice):
     try:
         logging.info("Fetching all pods...")
-        cmd = ["kubectl", "get", "pods", "-A"]
-        result = subprocess.run(cmd, check=True, text=True, capture_output=True)
-        output_lines = result.stdout.splitlines()
-        for line in output_lines[1:]:
-            parts = line.split()
-            if len(parts) > 3 and parts[1].startswith(microservice):
-                max_retries = 5
-                retries = 0
-                while True:
-                    if parts[3] == "Running":
-                        cmd = ["istioctl", "proxy-config", "log", f"{parts[1]}.default", "--level", "lua=info"]
+        max_retries = 5
+        retries = 0
+
+        while retries < max_retries:
+            cmd = ["kubectl", "get", "pods", "-A"]
+            result = subprocess.run(cmd, check=True, text=True, capture_output=True)
+            output_lines = result.stdout.splitlines()
+            for line in output_lines[1:]:
+                tokens = line.split()
+                if len(tokens) > 3 and tokens[1].startswith(microservice):
+                    if tokens[3] == "Running":
+                        cmd = ["istioctl", "proxy-config", "log", f"{tokens[1]}.default", "--level", "lua=info"]
                         result = subprocess.run(cmd, check=True, text=True, capture_output=True)
-                        break
-                    else:
-                        retries += 1
-                        time.sleep(1)
+
+                        cmd1 = ["istioctl", "proxy-config", "log", f"{tokens[1]}.default"]
+                        cmd2 = ["grep", "lua"]
+                        p1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE, text=True)
+                        p2 = subprocess.Popen(cmd2, stdin=p1.stdout, stdout=subprocess.PIPE, text=True)
+
+                        output, error = p2.communicate()
+                        if p2.returncode == 0 and "info" in output:
+                            retries = 5
+                        else:
+                            logging.error(f"enable_lua_logs(): {error} retries: {retries}")
+            retries += 1
+            time.sleep(1)
 
     except subprocess.CalledProcessError as e:
         logging.error("An error occurred while executing kubectl commands.")
@@ -423,19 +435,21 @@ def generate_tikz_curve(rates, backlogs):
             
     return tikz_code
 
-def plog_tikz_image(rates, backlogs):
-    global run
-    file_path = f"{run}.curve.tex"
+def plot_tikz_image(rates, backlogs, microservice, api):
+    profile = f"{run}.{microservice}.{api}"
     tikz_code = generate_tikz_curve(rates, backlogs)
     with open(file_path, 'w') as file:
         file.write(tikz_code)
 
     try:
-        subprocess.run(["pdflatex", file_path], check=True,
+        subprocess.run(["pdflatex", f"{profile}.tex", "-output-directory=.."], check=True,
                        stdin=subprocess.PIPE,
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
-        logging.info(f"Compilation successful. PDF generated for {file_path}.")
+        logging.info(f"Compilation successful. PDF generated for {profile}.")
+        for tmp_file in [f"{profile}.aux", f"{profile}.log"]:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
     except subprocess.CalledProcessError as e:
         logging.error(f"Error during compilation: {e}")
     except FileNotFoundError:
@@ -620,64 +634,276 @@ def init_experiment_path():
     os.chdir(os.path.join(cwd, 'output'))
 
     while os.path.exists(os.path.join(cwd, 'output', run)):
-        (remained, last) = run.rsplit("-", 1)
-        trial = int(last) + 1
-        run = f"{remained}-{trial:03}"
+        trial = int(run) + 1
+        run = f"{trial:03}"
 
     os.mkdir(os.path.join(cwd, 'output', run))
     os.chdir(os.path.join(cwd, 'output', run))
 
-def parse_loki_log(rate, microservice, arrivals, departures, range_from, range_to):
+def parse_loki_log(rate, microservice, api, arrivals, departures, range_from, range_to):
     global run
 
     data = []
     backlogs = [0] * (len(arrivals) + 1)
     max_backlogs = [0] * (len(arrivals) + 1)
-    try:        
-        logging.info(f'Parse loki log')
-        cmd = ["logcli", "query", f'{{app="{microservice}"}}',
-               f'--from={range_from}', f'--to={range_to}', '--limit=0', '--forward']
-        with open(f"{run}.{microservice}.{rate}.log", "w") as log_file:
-            result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd="../../..")
-            log_file.write(result.stdout)
-    
-        pattern = (
-            r"^(?P<first_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"
-            r".*?"
-            r"(?P<second_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)"
-            r"\s+info\s+envoy\s+lua.*?script log:\s+"
-            r"(?P<direction>[IO])\s+"
-            r"(?P<type>[A-Z]+)"
-            r"(?:\s+(?P<status>\d{3}))?"
-            r"(?:\s+(?P<path>/[^\s]+))?"
-            r"\s+(?P<api_context>[^\s]+)"
-            r"\s+(?P<progress_context>[^\s]+)"
-            r".*thread=(?P<thread_id>\d+)"
-        )
+    start_timestamp = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    end_timestamp = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
-        with open(f"{run}.{rate}.log", "r") as log_file:
-            for line in log_file:
-                match = re.match(pattern, line)
-                if match:
-                    calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, match.groupdict())
-                    
-        plot(data, f"{run}.{microservice}.{rate}", len(arrivals))
-        return max_backlogs
+    time.sleep(2)
+    try:
+        target = f"{run}.{microservice}.{api}.{rate}"
+        # while True:
+        #     cmd = ["logcli", "query", f'{{app="{microservice}"}}',
+        #        f'--from={range_from}', f'--to={range_to}', '--limit=1']
+        #     result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd="../../..")
+        #     pattern = (
+        #         r"^(?P<first_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"
+        #         r".*?\}"
+        #         r"(?:\s+(?P<second_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)|"
+        #         r"\s+\[(?P<second_timestamp_braced>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\])"
+        #         r"?.*"
+        #     )
+        #     match = re.match(pattern, result.stdout)
+        #     if match:
+        #         group = match.groupdict()
+        #         last_timestamp_str = group["second_timestamp"] if group["second_timestamp"] else group["second_timestamp_braced"]
+
+        #         last_timestamp = datetime.datetime.fromisoformat(last_timestamp_str.replace("Z", "+00:00"))
+        #         range_to_timestamp = datetime.datetime.fromisoformat(range_to.replace("Z", "+00:00"))
+        #         if abs(range_to_timestamp - last_timestamp) < datetime.timedelta(milliseconds=500):
+        #             # print("In-time:", abs(range_to_timestamp - last_timestamp), last_timestamp, range_to_timestamp)
+        #             break
+        #         else:
+        #             print("Late:", abs(range_to_timestamp - last_timestamp), last_timestamp, range_to_timestamp)
+        #     else:
+        #         print(result.stdout)
+
+        #     # logging.warning(f'Waiting for logs: {target}')
+        #     time.sleep(3)
+
+        logging.info(f'Parse loki log {target}')
+        max_retries = 10
+        retries = 0
+        while retries < max_retries:
+            cmd = ["logcli", "query", f'{{app="{microservice}"}}',
+                f'--from={range_from}', f'--to={range_to}', '--limit=0', '--forward']
+            logging.info(" ".join(cmd))
+            with open(f"{target}.log", "w") as log_file:
+                result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd="../../../..")
+                log_file.write(result.stdout)
+        
+            pattern = (
+                r"^(?P<first_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"
+                r".*?"
+                r"(?P<second_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)"
+                r"\s+info\s+envoy\s+lua.*?script log:\s+"
+                r"(?P<direction>[IO])\s+"
+                r"(?P<type>[A-Z]+)"
+                r"(?:\s+(?P<status>\d{3}))?"
+                r"(?:\s+(?P<path>/[^\s]+))?"
+                r"\s+(?P<api_context>[^\s]+)"
+                r"\s+(?P<progress_context>[^\s]+)"
+                r".*thread=(?P<thread_id>\d+)"
+            )
+
+            with open(f"{target}.log", "r") as log_file:
+                measured_timestamps = []
+                for line in log_file:
+                    match = re.match(pattern, line)
+                    if match:
+                        timestamp, interval_measured = calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, match.groupdict())
+
+                        if start_timestamp > timestamp:
+                            start_timestamp = timestamp
+                        if end_timestamp < timestamp:
+                            end_timestamp = timestamp
+
+                        if interval_measured:
+                            measured_timestamps.append(timestamp)
+                        
+            # range_to_timestamp = datetime.datetime.fromisoformat(range_to.replace("Z", "+00:00"))
+            logging.info(f"Time window: {abs(end_timestamp - start_timestamp)} {start_timestamp} {end_timestamp}")
+            if abs(end_timestamp - start_timestamp) >= datetime.timedelta(seconds=2.7):
+                break
+            else:
+                logging.warning(f"Not sufficient: {abs(end_timestamp - start_timestamp)} {start_timestamp} {end_timestamp}")
+                retries += 1
+            time.sleep(2)
+        plot(data, target, len(arrivals))
+
+        if len(measured_timestamps) > 1:
+            intervals = []
+            for i in range(1, len(measured_timestamps)):
+                interval = (measured_timestamps[i] - measured_timestamps[i-1]).total_seconds()
+                intervals.append(interval)
+            # print(np.average(intervals), np.std(intervals), 1/rate)
+        return max_backlogs, np.average(intervals)
 
     except subprocess.CalledProcessError as e:
         logging.error(e.stderr)
 
+def is_internal(l1, l2, l3):
+    # Check if the (l1, l2) intersection is larger than the (l2, l3) intersection
+    # Note that the second elements (intercepts) are positive
+    return (l1[0] - l2[0]) * (l2[1] - l3[1]) <= (l2[0] - l3[0]) * (l1[1] - l2[1])
+
+def update_hulls(hulls, rates, backlogs, x_threshold):
+    is_updated = False
+
+    for i in range(len(backlogs)):
+        lines = [(rates[j], backlogs[i][j]) for j in range(len(rates))]
+        lines.sort(key=lambda x: (x[0], -x[1]))
+        
+        new_hull = []
+
+        for line in lines:
+            # While the last two lines and the current line make the second-to-last line redundant, remove it
+            while len(new_hull) >= 2 and is_internal(new_hull[-2], new_hull[-1], line):
+                new_hull.pop()
+            if len(new_hull) >= 1:
+                if (new_hull[-1][1] - line[1]) / (new_hull[-1][0] - line[0]) < x_threshold:
+                    new_hull.append(line)
+            else:
+                new_hull.append(line)
+
+        if not new_hull == hulls[i]:
+            # print(i, new_hull, hulls[i])
+            hulls[i] = new_hull
+            is_updated = True
+
+    return is_updated
+
+def find_max_segments(lines):
+    # Sort lines by slope first (s), and then by intercept (-c) in descending order
+    lines.sort(key=lambda x: (x[0], -x[1]))
+
+    # List to store the selected lines forming the upper envelope
+    hull = []
+    intersections = []
+
+    for line in lines:
+        # While the last two lines and the current line make the second-to-last line redundant, remove it
+        while len(hull) >= 2 and is_internal(hull[-2], hull[-1], line):
+            hull.pop()
+            intersections.pop()
+        if hull:
+            s1, c1 = hull[-1]
+            s2, c2 = line
+            x_intersection = (c1 - c2) / (s1 - s2)
+            intersections.append(x_intersection)
+        hull.append(line)
+
+    result = []
+    prev_x = float('-inf')
+    for i in range(len(hull)):
+        s, a = hull[i]
+        x_end = intersections[i] if i < len(intersections) else float('inf')
+        result.append((s, a, prev_x, x_end))
+        prev_x = x_end
+    
+    return result
+
+def find_min_segments(segments_per_api):
+    x = set()
+    for segments in segments_per_api:
+        for s, c, x_start, x_end in segments:
+            x.add(x_start)
+            x.add(x_end)
+    
+    x = sorted(x)
+    intersections = [val for val in x if 0 <= val <= 1]
+
+def find_min_segment(segments_per_api, x):
+    min_y = float('inf')
+
+    for segments in segments_per_api:
+        for s, c, x_start, x_end in segments:
+            if x_start <= x <= x_end:
+                y = s * x - c
+                min_y = min(min_y, y)
+
+    return min_y if min_y != float('inf') else None
+
+def plot_tikz_image_by_hull(segments_per_api, name):
+    tikz_code = """
+\\documentclass{article}
+\\usepackage[active,tightpage]{preview}
+\\usepackage{tikz}
+\\usepackage{pgfplots}
+\\begin{document}
+\\begin{preview}
+\\begin{tikzpicture}
+\\begin{axis}[
+    axis lines=middle,
+    xlabel={$t$},
+    ylabel={Value},
+    xmin=0, xmax=1,
+    ymin=0, ymax=500,
+    domain=-10:10,
+    samples=200,
+    legend pos=north west,
+    grid=both,
+]
+"""
+
+    for segment in segments_per_api:
+        for s, c, x_start, x_end in segment:
+            if x_start == float('-inf'):
+                x_start = -10
+            if x_end == float('inf'):
+                x_end = 10
+            tikz_code += f"\\addplot[domain={x_start}:{x_end}, samples=2] {{{s}*x - {c}}};\n"
+
+    tikz_code += "\\end{axis}\n\\end{tikzpicture}\n\\end{preview}\n\\end{document}"
+
+    with open(f"{name}.tex", 'w') as file:
+        file.write(tikz_code)
+
+    try:
+        subprocess.run(["pdflatex", f"{name}.tex"], check=True,
+                       stdin=subprocess.PIPE,
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        logging.info(f"Compilation successful. PDF generated for {name}.")
+        for tmp_file in [f"{name}.aux", f"{name}.log"]:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error during compilation: {e}")
+    except FileNotFoundError:
+        logging.error("pdflatex not found. Make sure it is installed and in your PATH.")
+
 if __name__ == "__main__":
-    run = f"run-000"
+    with open ("output/012/hr.json", "r") as json_file:
+        profiles = json.load(json_file)
+
+    for profile in profiles:
+        print(profile["microservice"], profile["api"])
+
+        rates = profile["rates"]
+        backlogs = profile["backlogs"]
+        hulls = [[(rate, backlogs[i][j]) for j, rate in enumerate(rates)] for i in range(len(backlogs))]
+        
+        segments_per_api = []
+        for i, hull in enumerate(hulls):
+            segments = find_max_segments(hull)
+            for s, c, x_start, x_end in segments:
+                print(f"{i}: {s}x - {c}, Range: [{x_start}, {x_end}]")
+            segments_per_api.append(segments)
+        
+        plot_tikz_image_by_hull(segments_per_api[1:], f'hull.{profile["microservice"]}.{profile["api"]}')
+            
+    sys.exit()
+    
+    run = f"000"
     init_experiment_path()
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--threshold', default=1000)
     parser.add_argument('--app', '-a')
     parser.add_argument('--microservice', '-m')
     parser.add_argument('--api', '-i')
     parser.add_argument('--log', '-l', default="warning")
-
-    global args
     args = parser.parse_args()
 
     if args.log == "critical":
@@ -694,83 +920,131 @@ if __name__ == "__main__":
         print(f"{args.log} is not an available log level. Available: critical, error, warning, info, debug")
         exit()
     
-    spans, dependencies = get_spans_dependencies(args.app, args.microservice, args.api)
+    with open(f'../../{args.app}/{args.app}-spec.json', 'r') as spec_file:
+        spec = json.load(spec_file)
+    
+    profiles = []
+    targets = get_profiling_targets(spec)
+    # targets = [("profile", "get-profiles"), ("frontend", "hotels")]
+    print(f"run: {run} {args.app}", " ".join([f"{target[0]}:{target[1]}" for target in targets]))
+    for i, target in enumerate(targets):
+        microservice = target[0]
+        api = target[1]
+        print(f"{microservice}:{api} ({i+1}/{len(targets)})")
 
-    arrivals = []
-    departures = []
+        spans, dependencies = get_spans_dependencies(spec, microservice, api)
 
-    arrivals.append(('I', 'REQ', 'no-progress'))
-    for span in spans:
-        arrivals.append(('O', 'RES', span["api"]))
-        departures.append(('O', 'REQ', span["api"]))
-    departures.append(('I', 'RES', 'no-progress'))
+        arrivals = []
+        departures = []
+        arrivals.append(('I', 'REQ', 'no-progress'))
+        for span in spans:
+            arrivals.append(('O', 'RES', span["api"]))
+            departures.append(('O', 'REQ', span["api"]))
+        departures.append(('I', 'RES', 'no-progress'))
 
-    clear_envoyfilter()
-    apply_envoyfilter(args.app, args.microservice, args.api)
+        clear_envoyfilter()
+        apply_envoyfilter(args.app, microservice, api)
 
-    rates = []
-    backlogs = [[] for _ in range(len(spans) + 2)]
+        rates = []
+        backlogs = [[] for _ in range(len(spans) + 2)]
+        hulls = [[] for _ in range(len(spans) + 2)]
 
-    exponential_growth = True
-    current_rate = 50
-    step_size = 100
-    threshold = 1
+        exponential_growth = True
+        current_rate = 50
+        step_size = 100
+        threshold = args.threshold / 1000
 
-    # pods = init_pods(args.microservice, dependencies)
-    enable_lua_logs(args.microservice)
-
-    while True:
-        range_from = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-        responses = run_constant_interval(current_rate, 3, args.app, args.microservice, args.api)
-        range_to = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-        if not responses:
-            logging.error(f"No responses from a constant_interval scan: {current_rate}")
-            break
-
-        results = {"num_responses": int(responses[0]),
-                   "num_failures": int(responses[1]),
-                   "mean": float(responses[2]),
-                   "p50": float(responses[3]),
-                   "p90": float(responses[4]),
-                   "p99": float(responses[5]),
-                   "p99.9": float(responses[6])
-                }
+        enable_lua_logs(microservice)
         
-        results["max_backlogs"] = parse_loki_log(current_rate, args.microservice, arrivals, departures, range_from, range_to)
-        
-        # logs = gen_log(pods, current_rate)
-        # parse_log(arrivals, departures, results, logs)
+        os.mkdir(f"{run}.{microservice}.{api}")
+        os.chdir(f"{run}.{microservice}.{api}")
 
-        print(f'{current_rate} {results["num_responses"]} {results["num_failures"]} {results["mean"]:.3f}',
-              f'{results["p50"]:.3f} {results["p90"]:.3f} {results["p99"]:.3f} {results["p99.9"]:.3f} {results["max_backlogs"]}')
-        rates.append(current_rate)
-        for i, max_backlog in enumerate(results["max_backlogs"]):
-            backlogs[i].append(results["max_backlogs"][i])
+        while True:
+            logging.info("Checking all pods...")
+            max_retries = 20
+            retries = 0
+            while retries < max_retries:
+                cmd = ["kubectl", "get", "pods", "-A"]
+                result = subprocess.run(cmd, check=True, text=True, capture_output=True)
+                output_lines = result.stdout.splitlines()
+                not_running = []
+                for line in output_lines[1:]:
+                    tokens = line.split()
+                    if len(tokens) > 3 and (tokens[1].startswith(microservice) or any(tokens[1].startswith(dependency) for dependency in dependencies)):
+                        if not tokens[3] == "Running":
+                            not_running.append(tokens[1])
+                        
+                if len(not_running) > 0:
+                    logging.info(f"Pod {not_running} are not running")
+                    retries += 1
+                    time.sleep(10)
+                else:
+                    break
 
-        # if current_rate <= 200:
-        #     current_rate += 100
-        #     continue
-        # else:
-        #     break
+            logging.info("Start scanning.")
+            range_from = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+            responses = run_constant_interval(current_rate, 3, args.app, microservice, api)
+            range_to = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
-        # If the p99 response time is larger than the threshold or the failure ratio is larger than 0.2,
-        # it stops the exponential growth, and backoffs to the last rate + step size
-        if results["p99"] >= threshold or results["num_failures"] / results["num_responses"] > 0.2:
-            if exponential_growth:
-                exponential_growth = False
-                step_size = int(current_rate / 2 * 0.2)
-                current_rate = int(current_rate / 2 + step_size)
-            else:
+            if not responses:
+                logging.error(f"No responses from a constant_interval scan: {current_rate}")
                 break
-        else:
-            if exponential_growth:
-                current_rate *= 2
-            else:
-                current_rate += step_size
-        
-        # Sleep sufficiently (we use the p99.9 response time of the last run) to absorb the queued requests
-        time.sleep(results["p99.9"])
 
-    plog_tikz_image(rates, backlogs)
-    clear_envoyfilter()
+            results = {"num_responses": int(responses[0]),
+                    "num_failures": int(responses[1]),
+                    "mean": float(responses[2]),
+                    "p50": float(responses[3]),
+                    "p90": float(responses[4]),
+                    "p99": float(responses[5]),
+                    "p99.9": float(responses[6])
+                    }
+            
+            results["max_backlogs"], results["mean_interval"] = parse_loki_log(current_rate, microservice, api, arrivals, departures, range_from, range_to)
+            
+            # logs = gen_log(pods, current_rate)
+            # parse_log(arrivals, departures, results, logs)
+
+            print(f'  {current_rate} {results["num_responses"]} {results["num_failures"]} {results["mean"]:.3f}',
+                f'{results["p50"]:.3f} {results["p90"]:.3f} {results["p99"]:.3f} {results["p99.9"]:.3f} {results["max_backlogs"]}')
+        
+            break_signal = False
+            # We do not update this run
+            fail_ratio = results["num_failures"] / results["num_responses"]
+            interval_ratio = abs(current_rate * results["mean_interval"] - 1)
+            if fail_ratio < 0.2 or results["p99"] < threshold or interval_ratio < 0.2:
+                rates.append(current_rate)
+                for j, max_backlog in enumerate(results["max_backlogs"]):
+                    backlogs[j].append(results["max_backlogs"][j])
+
+                updated = update_hulls(hulls, rates, backlogs, threshold)
+                if not updated:
+                    break_signal = True
+            else:
+                break_signal = True
+
+            if break_signal:
+                logging.warning(f'updated: {updated} fail_ratio: {fail_ratio:.2f} results["p99"]: {results["p99"]:.3f}')
+                logging.warning(f'interval_ratio: {interval_ratio:.2f} exponential_growth: {exponential_growth}')
+                if exponential_growth:
+                    exponential_growth = False
+                    step_size = int(current_rate / 2 * 0.2)
+                    current_rate = int(current_rate / 2 + step_size)
+                else:
+                    os.chdir(f"..")
+                    break
+            else:
+                if exponential_growth:
+                    current_rate *= 2
+                else:
+                    current_rate += step_size
+
+            time.sleep(results["p99.9"])
+
+        plot_tikz_image(rates, backlogs, microservice, api)
+
+        profiles.append({"microservice": microservice, "api": api, "rates": rates, "backlogs": backlogs})
+        clear_envoyfilter()
+
+    profile_output = f"{args.app}.json"
+    with open(profile_output, "w") as file:
+        json.dump(profiles, file, indent=4)
