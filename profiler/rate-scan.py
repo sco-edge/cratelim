@@ -255,7 +255,6 @@ def enable_lua_logs(microservice):
                         else:
                             logging.error(f"enable_lua_logs(): {error} retries: {retries}")
             retries += 1
-            time.sleep(1)
 
     except subprocess.CalledProcessError as e:
         logging.error("An error occurred while executing kubectl commands.")
@@ -414,7 +413,7 @@ def generate_tikz_curve(rates, backlogs):
     xlabel={$t$},
     ylabel={Value},
     xmin=0, xmax=1,
-    ymin=-15, ymax=500,
+    ymin=0, ymax=2000,
     domain=0:10,
     samples=200,
     legend pos=north west,
@@ -438,7 +437,7 @@ def generate_tikz_curve(rates, backlogs):
 def plot_tikz_image(rates, backlogs, microservice, api):
     profile = f"{run}.{microservice}.{api}"
     tikz_code = generate_tikz_curve(rates, backlogs)
-    with open(file_path, 'w') as file:
+    with open(f"{profile}.tex", 'w') as file:
         file.write(tikz_code)
 
     try:
@@ -640,53 +639,23 @@ def init_experiment_path():
     os.mkdir(os.path.join(cwd, 'output', run))
     os.chdir(os.path.join(cwd, 'output', run))
 
-def parse_loki_log(rate, microservice, api, arrivals, departures, range_from, range_to):
-    global run
-
+def parse_loki_log(rate, duration, microservice, api, arrivals, departures, range_from, range_to):
     data = []
     backlogs = [0] * (len(arrivals) + 1)
     max_backlogs = [0] * (len(arrivals) + 1)
     start_timestamp = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
     end_timestamp = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
-    time.sleep(2)
     try:
         target = f"{run}.{microservice}.{api}.{rate}"
-        # while True:
-        #     cmd = ["logcli", "query", f'{{app="{microservice}"}}',
-        #        f'--from={range_from}', f'--to={range_to}', '--limit=1']
-        #     result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd="../../..")
-        #     pattern = (
-        #         r"^(?P<first_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)"
-        #         r".*?\}"
-        #         r"(?:\s+(?P<second_timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)|"
-        #         r"\s+\[(?P<second_timestamp_braced>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\])"
-        #         r"?.*"
-        #     )
-        #     match = re.match(pattern, result.stdout)
-        #     if match:
-        #         group = match.groupdict()
-        #         last_timestamp_str = group["second_timestamp"] if group["second_timestamp"] else group["second_timestamp_braced"]
-
-        #         last_timestamp = datetime.datetime.fromisoformat(last_timestamp_str.replace("Z", "+00:00"))
-        #         range_to_timestamp = datetime.datetime.fromisoformat(range_to.replace("Z", "+00:00"))
-        #         if abs(range_to_timestamp - last_timestamp) < datetime.timedelta(milliseconds=500):
-        #             # print("In-time:", abs(range_to_timestamp - last_timestamp), last_timestamp, range_to_timestamp)
-        #             break
-        #         else:
-        #             print("Late:", abs(range_to_timestamp - last_timestamp), last_timestamp, range_to_timestamp)
-        #     else:
-        #         print(result.stdout)
-
-        #     # logging.warning(f'Waiting for logs: {target}')
-        #     time.sleep(3)
-
         logging.info(f'Parse loki log {target}')
+
         max_retries = 10
         retries = 0
         while retries < max_retries:
-            cmd = ["logcli", "query", f'{{app="{microservice}"}}',
-                f'--from={range_from}', f'--to={range_to}', '--limit=0', '--forward']
+            time.sleep(0.5)
+
+            cmd = ["logcli", "query", f'{{app="{microservice}"}}', f'--from={range_from}', f'--to={range_to}', '--limit=0', '--forward']
             logging.info(" ".join(cmd))
             with open(f"{target}.log", "w") as log_file:
                 result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd="../../../..")
@@ -721,14 +690,13 @@ def parse_loki_log(rate, microservice, api, arrivals, departures, range_from, ra
                         if interval_measured:
                             measured_timestamps.append(timestamp)
                         
-            # range_to_timestamp = datetime.datetime.fromisoformat(range_to.replace("Z", "+00:00"))
-            logging.info(f"Time window: {abs(end_timestamp - start_timestamp)} {start_timestamp} {end_timestamp}")
-            if abs(end_timestamp - start_timestamp) >= datetime.timedelta(seconds=2.7):
+            # We allow duration * 0.9
+            logging.debug(f"Time window: {abs(end_timestamp - start_timestamp)} {start_timestamp} {end_timestamp}")
+            if abs(end_timestamp - start_timestamp) >= datetime.timedelta(milliseconds=(duration * 0.9)):
                 break
             else:
-                logging.warning(f"Not sufficient: {abs(end_timestamp - start_timestamp)} {start_timestamp} {end_timestamp}")
+                logging.debug(f"Not sufficient: {abs(end_timestamp - start_timestamp)} {start_timestamp} {end_timestamp}")
                 retries += 1
-            time.sleep(2)
         plot(data, target, len(arrivals))
 
         if len(measured_timestamps) > 1:
@@ -737,7 +705,8 @@ def parse_loki_log(rate, microservice, api, arrivals, departures, range_from, ra
                 interval = (measured_timestamps[i] - measured_timestamps[i-1]).total_seconds()
                 intervals.append(interval)
             # print(np.average(intervals), np.std(intervals), 1/rate)
-        return max_backlogs, np.average(intervals)
+            return max_backlogs, np.average(intervals)
+        logging.error("parse_loki_log() has no measured timestamps")
 
     except subprocess.CalledProcessError as e:
         logging.error(e.stderr)
@@ -761,7 +730,7 @@ def update_hulls(hulls, rates, backlogs, x_threshold):
             while len(new_hull) >= 2 and is_internal(new_hull[-2], new_hull[-1], line):
                 new_hull.pop()
             if len(new_hull) >= 1:
-                if (new_hull[-1][1] - line[1]) / (new_hull[-1][0] - line[0]) < x_threshold:
+                if (new_hull[-1][1] - line[1]) / (new_hull[-1][0] - line[0]) * 1000 < x_threshold:
                     new_hull.append(line)
             else:
                 new_hull.append(line)
@@ -803,27 +772,6 @@ def find_max_segments(lines):
     
     return result
 
-def find_min_segments(segments_per_api):
-    x = set()
-    for segments in segments_per_api:
-        for s, c, x_start, x_end in segments:
-            x.add(x_start)
-            x.add(x_end)
-    
-    x = sorted(x)
-    intersections = [val for val in x if 0 <= val <= 1]
-
-def find_min_segment(segments_per_api, x):
-    min_y = float('inf')
-
-    for segments in segments_per_api:
-        for s, c, x_start, x_end in segments:
-            if x_start <= x <= x_end:
-                y = s * x - c
-                min_y = min(min_y, y)
-
-    return min_y if min_y != float('inf') else None
-
 def plot_tikz_image_by_hull(segments_per_api, name):
     tikz_code = """
 \\documentclass{article}
@@ -838,7 +786,7 @@ def plot_tikz_image_by_hull(segments_per_api, name):
     xlabel={$t$},
     ylabel={Value},
     xmin=0, xmax=1,
-    ymin=0, ymax=500,
+    ymin=0, ymax=2000,
     domain=-10:10,
     samples=200,
     legend pos=north west,
@@ -873,38 +821,21 @@ def plot_tikz_image_by_hull(segments_per_api, name):
     except FileNotFoundError:
         logging.error("pdflatex not found. Make sure it is installed and in your PATH.")
 
-if __name__ == "__main__":
-    with open ("output/012/hr.json", "r") as json_file:
-        profiles = json.load(json_file)
-
-    for profile in profiles:
-        print(profile["microservice"], profile["api"])
-
-        rates = profile["rates"]
-        backlogs = profile["backlogs"]
-        hulls = [[(rate, backlogs[i][j]) for j, rate in enumerate(rates)] for i in range(len(backlogs))]
-        
-        segments_per_api = []
-        for i, hull in enumerate(hulls):
-            segments = find_max_segments(hull)
-            for s, c, x_start, x_end in segments:
-                print(f"{i}: {s}x - {c}, Range: [{x_start}, {x_end}]")
-            segments_per_api.append(segments)
-        
-        plot_tikz_image_by_hull(segments_per_api[1:], f'hull.{profile["microservice"]}.{profile["api"]}')
-            
-    sys.exit()
-    
+if __name__ == "__main__":    
     run = f"000"
     init_experiment_path()
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--duration', '-d', default=2000)
     parser.add_argument('--threshold', default=1000)
     parser.add_argument('--app', '-a')
     parser.add_argument('--microservice', '-m')
     parser.add_argument('--api', '-i')
     parser.add_argument('--log', '-l', default="warning")
     args = parser.parse_args()
+
+    duration = int(args.duration)
+    threshold = int(args.threshold)
 
     if args.log == "critical":
         logging.basicConfig(level=logging.CRITICAL)
@@ -924,9 +855,12 @@ if __name__ == "__main__":
         spec = json.load(spec_file)
     
     profiles = []
-    targets = get_profiling_targets(spec)
-    # targets = [("profile", "get-profiles"), ("frontend", "hotels")]
+    if args.microservice != None and args.api != None:
+        targets = [(args.microservice, args.api)]
+    else:
+        targets = get_profiling_targets(spec)
     print(f"run: {run} {args.app}", " ".join([f"{target[0]}:{target[1]}" for target in targets]))
+
     for i, target in enumerate(targets):
         microservice = target[0]
         api = target[1]
@@ -950,9 +884,8 @@ if __name__ == "__main__":
         hulls = [[] for _ in range(len(spans) + 2)]
 
         exponential_growth = True
-        current_rate = 50
+        current_rate = 200
         step_size = 100
-        threshold = args.threshold / 1000
 
         enable_lua_logs(microservice)
         
@@ -975,7 +908,7 @@ if __name__ == "__main__":
                             not_running.append(tokens[1])
                         
                 if len(not_running) > 0:
-                    logging.info(f"Pod {not_running} are not running")
+                    logging.warning(f"Pod {not_running} are not running")
                     retries += 1
                     time.sleep(10)
                 else:
@@ -983,11 +916,12 @@ if __name__ == "__main__":
 
             logging.info("Start scanning.")
             range_from = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-            responses = run_constant_interval(current_rate, 3, args.app, microservice, api)
+            responses = run_constant_interval(current_rate, duration, args.app, microservice, api)
             range_to = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
             if not responses:
                 logging.error(f"No responses from a constant_interval scan: {current_rate}")
+                os.chdir(f"..")
                 break
 
             results = {"num_responses": int(responses[0]),
@@ -999,7 +933,7 @@ if __name__ == "__main__":
                     "p99.9": float(responses[6])
                     }
             
-            results["max_backlogs"], results["mean_interval"] = parse_loki_log(current_rate, microservice, api, arrivals, departures, range_from, range_to)
+            results["max_backlogs"], results["mean_interval"] = parse_loki_log(current_rate, duration, microservice, api, arrivals, departures, range_from, range_to)
             
             # logs = gen_log(pods, current_rate)
             # parse_log(arrivals, departures, results, logs)
@@ -1011,32 +945,52 @@ if __name__ == "__main__":
             # We do not update this run
             fail_ratio = results["num_failures"] / results["num_responses"]
             interval_ratio = abs(current_rate * results["mean_interval"] - 1)
-            if fail_ratio < 0.2 or results["p99"] < threshold or interval_ratio < 0.2:
+            if fail_ratio < 0.04 and interval_ratio < 0.2 and results["p99.9"] * 1000 < threshold:
                 rates.append(current_rate)
                 for j, max_backlog in enumerate(results["max_backlogs"]):
                     backlogs[j].append(results["max_backlogs"][j])
 
                 updated = update_hulls(hulls, rates, backlogs, threshold)
                 if not updated:
+                    logging.debug(f'ex: {exponential_growth} updated: {updated}')
                     break_signal = True
             else:
+                logging.debug(f'ex: {exponential_growth} fail: {fail_ratio:.2f} interval: {interval_ratio:.2f} p99.9: {results["p99.9"]:.3f}')
                 break_signal = True
 
+                # restart the pod
+                if fail_ratio >= 0.04:
+                    cmd = ["kubectl", "get", "pods", "-A"]
+                    result = subprocess.run(cmd, check=True, text=True, capture_output=True)
+                    output_lines = result.stdout.splitlines()
+                    pods_to_restart = []
+                    for line in output_lines[1:]:
+                        tokens = line.split()
+                        if len(tokens) > 3 and (tokens[1].startswith(microservice) or any(tokens[1].startswith(dependency) for dependency in dependencies)):
+                            pods_to_restart.append(tokens[1])
+                            
+                    if len(pods_to_restart) > 0:
+                        logging.warning(f"Restart Pods {pods_to_restart}")
+                        for pod in pods_to_restart:
+                            cmd = ["kubectl", "delete", "pod", pod]
+                            result = subprocess.run(cmd, check=True, text=True, capture_output=True)
+
+                        # enable lua logs at the new pod
+                        enable_lua_logs(microservice)
+
             if break_signal:
-                logging.warning(f'updated: {updated} fail_ratio: {fail_ratio:.2f} results["p99"]: {results["p99"]:.3f}')
-                logging.warning(f'interval_ratio: {interval_ratio:.2f} exponential_growth: {exponential_growth}')
                 if exponential_growth:
                     exponential_growth = False
-                    step_size = int(current_rate / 2 * 0.2)
-                    current_rate = int(current_rate / 2 + step_size)
+                    # step_size = int(current_rate * 0.2)
+                    # current_rate = int(current_rate / 2)
+                    current_rate += step_size
                 else:
                     os.chdir(f"..")
                     break
             else:
-                if exponential_growth:
-                    current_rate *= 2
-                else:
-                    current_rate += step_size
+                # if exponential_growth:
+                #     step_size *= 2
+                current_rate += step_size
 
             time.sleep(results["p99.9"])
 
@@ -1045,6 +999,35 @@ if __name__ == "__main__":
         profiles.append({"microservice": microservice, "api": api, "rates": rates, "backlogs": backlogs})
         clear_envoyfilter()
 
-    profile_output = f"{args.app}.json"
+    for profile in profiles:
+        logging.debug(profile["microservice"], profile["api"])
+
+        rates = profile["rates"]
+        backlogs = profile["backlogs"]
+        hulls = [[(rate, backlogs[i][j]) for j, rate in enumerate(rates)] for i in range(len(backlogs))]
+        
+        segments_per_api = []
+        for i, hull in enumerate(hulls):
+            segments = find_max_segments(hull)
+            for s, c, x_start, x_end in segments:
+                logging.debug(f"{i}: {s}x - {c}, Range: [{x_start}, {x_end}]")
+            segments_per_api.append(segments)
+        
+        plot_tikz_image_by_hull(segments_per_api[1:], f'{run}.{profile["microservice"]}.{profile["api"]}.hull')
+
+        segments_per_api_sanitized = []
+        for segments in segments_per_api:
+            segments_sanitized = []
+            for s, c, x_start, x_end in segments:
+                if x_start == float('-inf'):
+                    x_start = -1e308
+                if x_end == float('inf'):
+                    x_end = 1e308
+                segments_sanitized.append((s, c, x_start, x_end))
+            segments_per_api_sanitized.append(segments_sanitized)
+        profile["segments_per_api"] = segments_per_api_sanitized
+
+    # Write the profile in a json file
+    profile_output = f"{run}.{args.app}.json"
     with open(profile_output, "w") as file:
         json.dump(profiles, file, indent=4)
