@@ -186,7 +186,7 @@ def run_wrk2(rps):
 def run_constant_interval(rps, duration, app, microservice, api):
     command = ["./constant-interval-hr.py", "--rps", str(rps), "--duration", str(duration), "-a", app, "-m", microservice, "-i", api]
     try:
-        result = subprocess.run(command, check=True, text=True, capture_output=True, cwd=os.path.join("../../..", app))
+        result = subprocess.run(command, check=True, text=True, capture_output=True, cwd=os.path.join(profiler_cwd, app))
         logging.info("Load script execution completed successfully.")
         responses = result.stdout
     except subprocess.CalledProcessError as e:
@@ -227,9 +227,9 @@ def run_locust(rps):
         logging.error("Locust execution failed:")
         logging.error(e.stderr)
 
-def enable_lua_logs(microservice):
+def enable_lua_logging(microservice):
     try:
-        logging.info("Fetching all pods...")
+        logging.info("enable_lua_logging(): fetching all pods.")
         max_retries = 5
         retries = 0
 
@@ -253,11 +253,11 @@ def enable_lua_logs(microservice):
                         if p2.returncode == 0 and "info" in output:
                             retries = 5
                         else:
-                            logging.error(f"enable_lua_logs(): {error} retries: {retries}")
+                            logging.error(f"enable_lua_logging(): {error} retries: {retries}")
             retries += 1
 
     except subprocess.CalledProcessError as e:
-        logging.error("An error occurred while executing kubectl commands.")
+        logging.error("enable_lua_logging(): an error occurred while executing kubectl commands.")
         logging.error(e.stderr)
 
 def init_pods(microservice, dependencies):
@@ -435,7 +435,7 @@ def generate_tikz_curve(rates, backlogs):
     return tikz_code
 
 def plot_tikz_image(rates, backlogs, microservice, api):
-    profile = f"{run}.{microservice}.{api}"
+    profile = f"{microservice}.{api}"
     tikz_code = generate_tikz_curve(rates, backlogs)
     with open(f"{profile}.tex", 'w') as file:
         file.write(tikz_code)
@@ -490,7 +490,7 @@ def clear_envoyfilter():
 
 def apply_envoyfilter(target_app, target_microservice, target_api):
     spans = None
-    with open(f'../../{target_app}/{target_app}-spec.json', 'r') as file:
+    with open(os.path.join(profiler_cwd, f'{target_app}/spec.json'), 'r') as file:
         data = json.load(file)
         
     if not target_app == data.get("app"):
@@ -627,17 +627,16 @@ spec:
 def init_experiment_path():
     global run
 
-    cwd = os.getcwd()
-    if not os.path.exists(os.path.join(cwd, 'output')):
-        os.mkdir(os.path.join(cwd, 'output'))
-    os.chdir(os.path.join(cwd, 'output'))
+    if not os.path.exists(os.path.join(profiler_cwd, 'output')):
+        os.mkdir(os.path.join(profiler_cwd, 'output'))
+    os.chdir(os.path.join(profiler_cwd, 'output'))
 
-    while os.path.exists(os.path.join(cwd, 'output', run)):
+    while os.path.exists(os.path.join(profiler_cwd, 'output', run)):
         trial = int(run) + 1
         run = f"{trial:03}"
 
-    os.mkdir(os.path.join(cwd, 'output', run))
-    os.chdir(os.path.join(cwd, 'output', run))
+    os.mkdir(os.path.join(profiler_cwd, 'output', run))
+    os.chdir(os.path.join(profiler_cwd, 'output', run))
 
 def parse_loki_log(rate, duration, microservice, api, arrivals, departures, range_from, range_to):
     data = []
@@ -647,7 +646,7 @@ def parse_loki_log(rate, duration, microservice, api, arrivals, departures, rang
     end_timestamp = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
     try:
-        target = f"{run}.{microservice}.{api}.{rate}"
+        target = f"{microservice}.{api}.{rate}"
         logging.info(f'Parse loki log {target}')
 
         max_retries = 10
@@ -658,7 +657,7 @@ def parse_loki_log(rate, duration, microservice, api, arrivals, departures, rang
             cmd = ["logcli", "query", f'{{app="{microservice}"}}', f'--from={range_from}', f'--to={range_to}', '--limit=0', '--forward']
             logging.info(" ".join(cmd))
             with open(f"{target}.log", "w") as log_file:
-                result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd="../../../..")
+                result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd=profiler_cwd)
                 log_file.write(result.stdout)
         
             pattern = (
@@ -821,14 +820,16 @@ def plot_tikz_image_by_hull(segments_per_api, name):
     except FileNotFoundError:
         logging.error("pdflatex not found. Make sure it is installed and in your PATH.")
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
+    profiler_cwd = os.getcwd()
     run = f"000"
     init_experiment_path()
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('app')
     parser.add_argument('--duration', '-d', default=2000)
     parser.add_argument('--threshold', default=1000)
-    parser.add_argument('--app', '-a')
+    # parser.add_argument('--app', '-a')
     parser.add_argument('--microservice', '-m')
     parser.add_argument('--api', '-i')
     parser.add_argument('--log', '-l', default="warning")
@@ -851,7 +852,7 @@ if __name__ == "__main__":
         print(f"{args.log} is not an available log level. Available: critical, error, warning, info, debug")
         exit()
     
-    with open(f'../../{args.app}/{args.app}-spec.json', 'r') as spec_file:
+    with open(os.path.join(profiler_cwd, f'{args.app}/spec.json'), 'r') as spec_file:
         spec = json.load(spec_file)
     
     profiles = []
@@ -859,7 +860,7 @@ if __name__ == "__main__":
         targets = [(args.microservice, args.api)]
     else:
         targets = get_profiling_targets(spec)
-    print(f"run: {run} {args.app}", " ".join([f"{target[0]}:{target[1]}" for target in targets]))
+    print(f"{run} {args.app}", " ".join([f"{target[0]}:{target[1]}" for target in targets]))
 
     for i, target in enumerate(targets):
         microservice = target[0]
@@ -884,13 +885,15 @@ if __name__ == "__main__":
         hulls = [[] for _ in range(len(spans) + 2)]
 
         exponential_growth = True
-        current_rate = 200
-        step_size = 100
-
-        enable_lua_logs(microservice)
+        current_rate = 25
         
-        os.mkdir(f"{run}.{microservice}.{api}")
-        os.chdir(f"{run}.{microservice}.{api}")
+        # As it is multiplied by 2, the first step size is 25
+        step_size = 12.5
+
+        enable_lua_logging(microservice)
+        
+        os.mkdir(f"{microservice}.{api}")
+        os.chdir(f"{microservice}.{api}")
 
         while True:
             logging.info("Checking all pods...")
@@ -934,7 +937,6 @@ if __name__ == "__main__":
                     }
             
             results["max_backlogs"], results["mean_interval"] = parse_loki_log(current_rate, duration, microservice, api, arrivals, departures, range_from, range_to)
-            
             # logs = gen_log(pods, current_rate)
             # parse_log(arrivals, departures, results, logs)
 
@@ -976,21 +978,21 @@ if __name__ == "__main__":
                             result = subprocess.run(cmd, check=True, text=True, capture_output=True)
 
                         # enable lua logs at the new pod
-                        enable_lua_logs(microservice)
+                        enable_lua_logging(microservice)
 
             if break_signal:
                 if exponential_growth:
                     exponential_growth = False
-                    # step_size = int(current_rate * 0.2)
-                    # current_rate = int(current_rate / 2)
+                    current_rate = int(current_rate / 2)
+                    step_size = int(current_rate * 0.2)
                     current_rate += step_size
                 else:
                     os.chdir(f"..")
                     break
             else:
-                # if exponential_growth:
-                #     step_size *= 2
-                current_rate += step_size
+                if exponential_growth:
+                    step_size *= 2
+                current_rate += int(step_size)
 
             time.sleep(results["p99.9"])
 
@@ -998,6 +1000,8 @@ if __name__ == "__main__":
 
         profiles.append({"microservice": microservice, "api": api, "rates": rates, "backlogs": backlogs})
         clear_envoyfilter()
+
+    json_profiles = {}
 
     for profile in profiles:
         logging.debug(profile["microservice"], profile["api"])
@@ -1013,7 +1017,8 @@ if __name__ == "__main__":
                 logging.debug(f"{i}: {s}x - {c}, Range: [{x_start}, {x_end}]")
             segments_per_api.append(segments)
         
-        plot_tikz_image_by_hull(segments_per_api[1:], f'{run}.{profile["microservice"]}.{profile["api"]}.hull')
+        print(segments_per_api)
+        plot_tikz_image_by_hull(segments_per_api[1:], f'{profile["microservice"]}.{profile["api"]}.hull')
 
         segments_per_api_sanitized = []
         for segments in segments_per_api:
@@ -1028,6 +1033,6 @@ if __name__ == "__main__":
         profile["segments_per_api"] = segments_per_api_sanitized
 
     # Write the profile in a json file
-    profile_output = f"{run}.{args.app}.json"
+    profile_output = f"{args.app}.json"
     with open(profile_output, "w") as file:
         json.dump(profiles, file, indent=4)
