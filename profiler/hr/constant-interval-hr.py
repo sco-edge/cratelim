@@ -23,14 +23,31 @@ import user_pb2
 import user_pb2_grpc
 import reservation_pb2
 import reservation_pb2_grpc
-
+from dataclasses import dataclass
 import numpy as np
 
 response_times = []
 failed_responses = 0
 
+@dataclass
+class HttpAPI:
+    is_gateway: bool
+    port: int
+    path: str
+    api_type: str
+    params: dict
+    headers: dict
+
+@dataclass
+class GrpcAPI:
+    is_gateway: bool
+    port: int
+    api_type: str
+    params: list
+    headers: dict
+
 def read_profile_spec(target_app, target_microservice, target_api):
-    with open(f'./{target_app}-spec.json', 'r') as file:
+    with open(f'./spec.json', 'r') as file:
         data = json.load(file)
 
     if not target_app == data.get("app"):
@@ -42,9 +59,28 @@ def read_profile_spec(target_app, target_microservice, target_api):
             apis = microservice.get("apis", [])
             for api in apis:  
                 if api.get("id") == target_api:
-                    return microservice.get("gateway"), microservice.get("port"), api.get("type"), api.get("params"), {"api-context": target_api}
+                    api_type = api.get("type")
+                    if api_type == "http":
+                        return HttpAPI(
+                            is_gateway=bool(microservice.get("gateway")),
+                            port=int(microservice.get("port")),
+                            path=api.get("path"),
+                            api_type=api_type,
+                            params=cast_http_params(api.get("params")),
+                            headers={"api-context": target_api}
+                        )
+                    elif api_type == "grpc":
+                        return GrpcAPI(
+                            is_gateway=bool(microservice.get("gateway")),
+                            port=int(microservice.get("port")),
+                            api_type=api_type,
+                            params=cast_grpc_params(api.get("params")),
+                            headers={"api-context": target_api}
+                        )
+                    else:
+                        raise ValueError(f"Unsupported (microservice, api): ({target_microservice}, {target_api})")
 
-    raise ValueError(f"Unsupported target: microservice: {target_microservice} api: {target_api}")
+    raise ValueError(f"Unsupported (microservice, api): ({target_microservice}, {target_api})")
 
 def cast_http_params(params):
     ret = {}
@@ -73,35 +109,35 @@ def cast_grpc_params(params):
 
     return ret
 
-async def send_grpc_request(stub, target_microservice, target_api, params, headers):
+async def send_grpc_request(stub, target_microservice, target_api, api):
     global failed_responses
     try:
-        metadata = [("api-context", headers["api-context"])]
+        metadata = [("api-context", api.headers["api-context"])]
         start_time = time.perf_counter()
 
-        if target_microservice == "profile" and target_api == "get-profiles":
-            request = profile_pb2.Request(hotelIds=params[0], locale=params[1])
+        if target_microservice == "profile" and target_api == "profile-get-profiles":
+            request = profile_pb2.Request(hotelIds=api.params[0], locale=api.params[1])
             response = await stub.GetProfiles(request, metadata=metadata)
-        elif target_microservice == "search" and target_api == "near-by":
-            request = search_pb2.NearbyRequest(lat=float(params[0]), lon=float(params[1]), inDate=params[2], outDate=params[3])
+        elif target_microservice == "search" and target_api == "search-near-by":
+            request = search_pb2.NearbyRequest(lat=float(api.params[0]), lon=float(api.params[1]), inDate=api.params[2], outDate=api.params[3])
             response = await stub.Nearby(request, metadata=metadata)
-        elif target_microservice == "geo" and target_api == "near-by":
-            request = geo_pb2.Request(lat=float(params[0]), lon=float(params[1]))
+        elif target_microservice == "geo" and target_api == "geo-near-by":
+            request = geo_pb2.Request(lat=float(api.params[0]), lon=float(api.params[1]))
             response = await stub.Nearby(request, metadata=metadata)
-        elif target_microservice == "rate" and target_api == "get-rates":
-            request = rate_pb2.Request(hotelIds=params[0], inDate=params[1], outDate=params[2])
+        elif target_microservice == "rate" and target_api == "rate-get-rates":
+            request = rate_pb2.Request(hotelIds=api.params[0], inDate=api.params[1], outDate=api.params[2])
             response = await stub.GetRates(request, metadata=metadata)
-        elif target_microservice == "recommendation" and target_api == "get-recommendations":
-            request = recommendation_pb2.Request(require=params[0], lat=float(params[1]), lon=float(params[2]))
+        elif target_microservice == "recommendation" and target_api == "recommendation-get-recommendations":
+            request = recommendation_pb2.Request(require=api.params[0], lat=float(api.params[1]), lon=float(api.params[2]))
             response = await stub.GetRecommendations(request, metadata=metadata)
-        elif target_microservice == "user" and target_api == "check-user":
-            request = user_pb2.Request(username=params[0], password=params[1])
+        elif target_microservice == "user" and target_api == "user-check-user":
+            request = user_pb2.Request(username=api.params[0], password=api.params[1])
             response = await stub.CheckUser(request, metadata=metadata)
-        elif target_microservice == "reservation" and target_api == "make-reservation":
-            request = reservation_pb2.Request(customerName=params[0], hotelId=params[1], inDate=params[2], outDate=params[3], roomNumber=int(params[4]))
+        elif target_microservice == "reservation" and target_api == "reservation-make-reservation":
+            request = reservation_pb2.Request(customerName=api.params[0], hotelId=api.params[1], inDate=api.params[2], outDate=api.params[3], roomNumber=int(api.params[4]))
             response = await stub.MakeReservation(request, metadata=metadata)
-        elif target_microservice == "reservation" and target_api == "check-availability":
-            request = reservation_pb2.Request(customerName=params[0], hotelId=params[1], inDate=params[2], outDate=params[3], roomNumber=int(params[4]))
+        elif target_microservice == "reservation" and target_api == "reservation-check-availability":
+            request = reservation_pb2.Request(customerName=api.params[0], hotelId=api.params[1], inDate=api.params[2], outDate=api.params[3], roomNumber=int(api.params[4]))
             response = await stub.CheckAvailability(request, metadata=metadata)
         
         logging.debug(response)
@@ -116,12 +152,12 @@ async def send_grpc_request(stub, target_microservice, target_api, params, heade
     except Exception as e:
         logging.error(f"Error sending request: {e}")
 
-async def grpc_test(rps, duration, ip, port, target_microservice, target_api, params, headers):
+async def grpc_test(rps, duration, ip, target_microservice, target_api, api):
     logging.debug(f"Starting load test with RPS: {rps} for {duration} seconds")
     interval = 1 / rps
     start_time = asyncio.get_event_loop().time()
 
-    async with grpc.aio.insecure_channel(f"{ip}:{port}") as channel:
+    async with grpc.aio.insecure_channel(f"{ip}:{api.port}") as channel:
         if target_microservice == "profile":
             stub = profile_pb2_grpc.ProfileStub(channel)
         elif target_microservice == "search":
@@ -145,7 +181,7 @@ async def grpc_test(rps, duration, ip, port, target_microservice, target_api, pa
             sleep_time = max(0, next_request_time - now)
             await asyncio.sleep(sleep_time)
 
-            task = asyncio.create_task(send_grpc_request(stub, target_microservice, target_api, params, headers))
+            task = asyncio.create_task(send_grpc_request(stub, target_microservice, target_api, api))
             tasks.append(task)
 
             next_request_time += interval
@@ -161,11 +197,12 @@ async def grpc_test(rps, duration, ip, port, target_microservice, target_api, pa
 
     logging.debug("Load test completed")
 
-async def send_http_request(session, ip, port, parameters, headers):
+async def send_http_request(session, ip, api):
     global failed_responses
     try:
         start_time = time.perf_counter()
-        async with session.get(f"http://{ip}:{port}/{args.api}", params=parameters, headers=headers) as response:
+        # async with session.get(f"http://{ip}:{port}/{args.api}", params=parameters, headers=headers) as response:
+        async with session.get(f"http://localhost:{api.port}/{api.path}", params=api.params, headers=api.headers) as response:
             logging.debug(response)
             body = await response.text()
             logging.debug(body)
@@ -182,12 +219,12 @@ async def send_http_request(session, ip, port, parameters, headers):
     except Exception as e:
         logging.error(f"Error sending request: {e}")
 
-async def http_test(rps, duration, ip, port, params, headers):
+async def http_test(rps, duration, ip, api):
     logging.debug(f"Starting load test with RPS: {rps} for {duration} seconds")
     interval = 1 / rps
     start_time = time.time()
 
-    connector = aiohttp.TCPConnector(limit=3000)
+    connector = aiohttp.TCPConnector(limit=12000)
     async with aiohttp.ClientSession(connector=connector) as session:
         next_request_time = start_time
         tasks = []
@@ -197,7 +234,7 @@ async def http_test(rps, duration, ip, port, params, headers):
             sleep_time = max(0, next_request_time - now)
             await asyncio.sleep(sleep_time)
 
-            task = asyncio.create_task(send_http_request(session, ip, port, params, headers))
+            task = asyncio.create_task(send_http_request(session, ip, api))
             tasks.append(task)
 
             next_request_time += interval
@@ -252,7 +289,7 @@ def get_microservice_ip(app, microservice, is_gateway):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--rps', '-r', default=10)
-    parser.add_argument('--duration', '-d', default=3)
+    parser.add_argument('--duration', '-d', default=2000)
     parser.add_argument('--app', '-a')
     parser.add_argument('--microservice', '-m')
     parser.add_argument('--api', '-i')
@@ -276,19 +313,13 @@ if __name__ == "__main__":
         exit()
 
     rps = int(args.rps)
-    duration = int(args.duration)
-    is_gateway, port, type, params, headers = read_profile_spec(args.app, args.microservice, args.api)
-    if type == "http":
-        params = cast_http_params(params)
-    elif type == "grpc":
-        params = cast_grpc_params(params)
-    else:
-        raise ValueError(f"Unsupported api type: type")
+    duration = int(args.duration) / 1000
+    # is_gateway, port, type, params, headers = read_profile_spec(args.app, args.microservice, args.api)
+    api = read_profile_spec(args.app, args.microservice, args.api)
+    ip = get_microservice_ip(args.app, args.microservice, api.is_gateway)
 
-    ip = get_microservice_ip(args.app, args.microservice, is_gateway)
-
-    logging.debug(f'Parameters: {params}')
-    if type == "http":
-        asyncio.run(http_test(rps, duration, ip, port, params, headers))
-    elif type == "grpc":
-        asyncio.run(grpc_test(rps, duration, ip, port, args.microservice, args.api, params, headers))
+    logging.debug(f'Parameters: {api.params}')
+    if api.api_type == "http":
+        asyncio.run(http_test(rps, duration, ip, api))
+    elif api.api_type == "grpc":
+        asyncio.run(grpc_test(rps, duration, ip, args.microservice, args.api, api))
