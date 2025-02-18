@@ -6,7 +6,9 @@ import subprocess
 import numpy as np
 import logging
 import argparse
-from pulp import LpMaximize, LpProblem, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
+from pulp import LpMaximize, LpProblem, LpVariable, lpSum, LpBinary, LpStatus
+# from pulp import PULP_CBC_CMD
+from pulp import GUROBI_CMD
 
 class Problem:
     def __init__(self, external_apis, apis, chains, index_segments, y_intersections, slopes,
@@ -15,59 +17,60 @@ class Problem:
         self.A = apis
         self.C = chains
         self.L_j = index_segments
-        self.b_j_k = y_intersections
+        self.y_j_k = y_intersections
         self.s_j_k = slopes
         self.c_j_k = intercepts
         self.w = weights
         self.D = deadlines
-
-        print(y_intersections)
+        print(index_segments)
 
     def solve(self):
         problem = LpProblem(name="milp-optimization", sense=LpMaximize)
 
-        M = 1e6
-        epsilon = 1e-6
+        M = 1e4
+        epsilon = 0.1
 
-        # Variables and constraint (10)
+        # Variables and constraint (11)
         b = LpVariable.dicts("b", [(i, j) for i in self.A_E for j in self.A], lowBound=0)
         B = LpVariable.dicts("B", self.A, lowBound=0)
         z = LpVariable.dicts("z", self.A_E, lowBound=0)
         v = LpVariable.dicts("v", [(j, k) for j in self.A for k in self.L_j[j]], lowBound=0)
 
-        # constraints (21, 22)
+        # constraints (22, 23)
         delta_b = LpVariable.dicts("delta",
                                    [(i, j, k) for i in self.A_E for j in self.A
                                     for k in self.L_j[j]], cat=LpBinary)
         lambda_b = LpVariable.dicts("lambda",
                                     [(j, k) for j in self.A for k in self.L_j[j]], cat=LpBinary)
 
-        # objective function (6)
+        # objective function (7)
+        # problem += lpSum(self.w[i] * (z[i] + b[i, j]) for i in self.A_E for j in self.C[i])
         problem += lpSum(self.w[i] * z[i] for i in self.A_E)
 
-        # # constraint (7)
+        # # constraint (8)
         # for i in self.A_E:
         #     for j in self.C[i]:
         #         for k in self.L_j[j]:
         #             problem += z[i] <= self.s_j_k[j][k] * delta_b[i, j, k]
 
-        # constraint (7)
+        # constraint (8)
         for i in self.A_E:
-            problem += z[i] <= lpSum(self.s_j_k[j][k] * delta_b[i, j, k] for j in self.C[i] for k in self.L_j[j])
+            for j in self.C[i]:
+                problem += z[i] <= lpSum(self.s_j_k[j][k] * delta_b[i, j, k] for k in self.L_j[j])
 
-        # constraints (8, 9)
+        # constraints (9, 10)
         for i in self.A_E:
             for j in self.C[i]:
                 for k in self.L_j[j]:
-                    problem += self.b_j_k[j][k] <= b[i, j] + M * (1 - delta_b[i, j, k])
-                    problem += b[i, j] <= self.b_j_k[j][k+1] - epsilon + M * (1 - delta_b[i, j, k])
+                    problem += self.y_j_k[j][k] <= b[i, j] + M * (1 - delta_b[i, j, k])
+                    problem += b[i, j] <= self.y_j_k[j][k+1] - epsilon + M * (1 - delta_b[i, j, k])
 
-        # constraint (11)
+        # constraint (12)
         for i in self.A_E:
             problem += lpSum((v[j, k] + lambda_b[j, k] * self.c_j_k[j][k]) / self.s_j_k[j][k]
                              for j in self.C[i] for k in self.L_j[j]) <= self.D[i]
 
-        # constraints (12, 13, 14, 15)
+        # constraints (13, 14, 15, 16)
         for j in self.A:
             for k in self.L_j[j]:
                 problem += v[j, k] <= M * lambda_b[j, k]
@@ -75,26 +78,32 @@ class Problem:
                 problem += v[j, k] <= B[j] + M * (1 - lambda_b[j, k])
                 problem += v[j, k] >= B[j] - M * (1 - lambda_b[j, k])
 
-        # constraints (16, 17)
+        # constraints (17, 18)
         for j in self.A:
             for k in self.L_j[j]:
-                problem += self.b_j_k[j][k] <= B[j] + M * (1 - lambda_b[j, k])
-                problem += B[j] <= self.b_j_k[j][k + 1] - epsilon + M * (1 - lambda_b[j, k])
+                problem += self.y_j_k[j][k] <= B[j] + M * (1 - lambda_b[j, k])
+                problem += B[j] <= self.y_j_k[j][k + 1] - epsilon + M * (1 - lambda_b[j, k])
 
-        # constraint (18)
+        # constraint (19)
         for j in self.A:
             problem += lpSum(b[i, j] for i in self.A_E) == B[j]
 
-        # constraint (19)
+        # constraint (20)
         for i in self.A_E:
             for j in self.C[i]:
                 problem += lpSum(delta_b[i, j, k] for k in self.L_j[j]) == 1
 
-        # constraint (20)
-        for j in self.A:
-            problem += lpSum(lambda_b[j, k] for k in self.L_j[j]) == 1
+        # constraint (21)
+        # for j in self.A:
+        for i in self.A_E:
+            for j in self.C[i]:
+                problem += lpSum(lambda_b[j, k] for k in self.L_j[j]) == 1
 
-        problem.solve()
+        problem.solve(GUROBI_CMD(options=[
+            ("Presolve", 0),
+            ("FeasibilityTol", 1e-9),
+            ("IntFeasTol", 1e-9),("MIPGap", 1e-9), ("TimeLimit", 600)]))
+        print("Solver Status:", LpStatus[problem.status])
 
         print(f"Objective Value = {problem.objective.value()}")
         for i in self.A_E:
@@ -133,6 +142,26 @@ class Problem:
             for budget in budgets.values():
                 sum += budget
             print(f"budgets[i={i}] = {budgets}, {sum}")
+
+        for constraint_name, constraint in problem.constraints.items():
+            lhs_value = constraint.value()
+            rhs_value = constraint.constant
+
+            if constraint.sense == -1:  # (LHS <= RHS)
+                slack = rhs_value - lhs_value
+            elif constraint.sense == 1:  # (LHS >= RHS)
+                slack = lhs_value - rhs_value
+            else:  # (LHS = RHS)
+                slack = abs(lhs_value - rhs_value)
+
+            # print(f"{constraint_name} {constraint} ({constraint.sense}): lhs = {lhs_value}, rhs = {rhs_value}, slack = {slack}")
+            # if "10000" in f"{constraint}":
+            #     continue
+            slack = -lhs_value if constraint.sense == -1 else lhs_value
+            print(f"{constraint_name} {constraint} ({constraint.sense}) lhs: {lhs_value} slack: {slack}")
+
+            # if abs(slack) < 1e-6:
+            #     print(f"  🔥 Constraint {constraint_name} is Tight! (slack = {slack})")
         return 
 
 def parse_profiles_with_subsidiaries(file_name, latency_slo):
@@ -156,10 +185,19 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
     #          ("user", "user-check-user"),
     #          ("reservation", "reservation-make-reservation")]
     # }
+
     hr_call_chains = {
         ("frontend", "frontend-hotels"):
-            [("geo", "geo-near-by")]
+            [("geo", "geo-near-by")],
+        # ("frontend", "frontend-recommendations"):
+        #     [("user", "user-check-user")],
     }
+
+    # hr_call_chains = {
+    #     ("frontend", "frontend-hotels"):
+    #         [("rate", "rate-get-rates"),
+    #          ("geo", "geo-near-by")]
+    # }
 
     with open(file_name, "r") as file:
         profiles = json.load(file)
@@ -183,7 +221,6 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
         sanitized_index_segments = {}
         
         for j, profile in enumerate(profiles):
-            print(f'{profile["microservice"]}-{profile["api"]}')
             if (profile["microservice"], profile["api"]) in hr_call_chains:
                 external_apis.append(j)
                 metadata_external_apis[f'{profile["microservice"]}-{profile["api"]}'] = j
@@ -230,18 +267,11 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
                         #     y_full[i].append(segment[0] * latency_slo - segment[1])
                         break
 
-            print(f'{profile["microservice"]}-{profile["api"]} y: {y_full}')
-            print(f'{profile["microservice"]}-{profile["api"]} s: {slopes_full}')
-            print(f'{profile["microservice"]}-{profile["api"]} c: {intercepts_full}')
-
             # Gather all breakpoints from every span
             y_for_ms = sorted(set(value for values in y_full.values() for value in values))
             slopes_for_ms = {}
             intercepts_for_ms = {}
             for k, bp in enumerate(y_for_ms):
-                # if k == len(y_for_ms) - 1:
-                #     break
-
                 segments_to_add = [0 for _ in range(len(y_full))]
                 for i in range(len(y_full)):
                     segment_index = segments_to_add[i]
@@ -254,11 +284,6 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
                         else:
                             break
                     segments_to_add[i] = segment_index
-                    # for k, insertection in enumerate(y_full[i]):
-                    #     if bp < insertection:
-                    #         segments_to_add.append(k-1)
-                    #         break
-                print(f"bp: {bp} sta:", segments_to_add)
 
                 if len(segments_to_add) == 0:
                     continue
@@ -285,18 +310,6 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
             intercepts[j] = intercepts_for_ms
             index_segments[j] = range(len(y_for_ms) - 1)
 
-            # while True:
-            #     spans_to_add = []
-            #     for i, segments in enumerate(profile["segments_per_api"][1:]):
-
-            # y = [segments[0][2] for segments in profile["segments_per_api"][1:]]
-            # print(breakpoints)            
-
-            # for i in range(len(profile["segments_per_api"]) - 1):
-            #     y_intersections[j] = []
-            #     slopes[j] = []
-            #     intercepts[j] = []
-
         chains = {}
         for m1, a1 in hr_call_chains:
             external_api = f"{m1}-{a1}"
@@ -313,15 +326,19 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
         print("apis:", apis)
         print("metadata_apis:", metadata_apis)
         print("chains:", chains)
-        for j in range(len(index_segments)):
-            print(f"{metadata_apis_inverse[j]} {j}  y: {ys[j]} s: {slopes[j]} c: {intercepts[j]} L: {index_segments[j]}")
+        # for j in range(len(index_segments)):
+        #     print(f"{metadata_apis_inverse[j]} {j}")
+        #     print(f"  y: {ys[j]}")
+        #     print(f"  s: {slopes[j]}")
+        #     print(f"  c: {intercepts[j]}")
+        #     print(f"  L: {index_segments[j]}")
         
         for name in metadata_apis:
             j = metadata_apis[name]
             xs = []
             for k in index_segments[j]:
                 x = (ys[j][k] + intercepts[j][k]) / slopes[j][k]
-                # print(name, j, k, x)
+                print(name, j, k, x, ys[j][k])
                 if x >= latency_slo:
                     break
                 xs.append(x)
@@ -334,11 +351,10 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
                     continue
                 x_end.append(x)
             x_end.append(latency_slo)
-            # print(x_start, x_end, slopes[j], intercepts[j], index_segments[j])
-            plot_tikz_image_by_hull(x_start, x_end, slopes[j], intercepts[j], index_segments[j], f"int.{name}", latency_slo)
 
-            print(j, name, xs, ys[j], slopes[j], intercepts[j], index_segments[j])
-            
+            if args.plot:
+                plot_tikz_image_by_hull(x_start, x_end, slopes[j], intercepts[j], index_segments[j], f"int.{name}", latency_slo)
+
             sanitized_y = []
             sanitized_slope = {}
             sanitized_intercept = {}
@@ -351,6 +367,12 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
             sanitized_slopes[j] = sanitized_slope
             sanitized_intercepts[j] = sanitized_intercept
             sanitized_index_segments[j] = range(k)
+            
+            print(f"{metadata_apis_inverse[j]} {j}")
+            print(f"  y: {sanitized_ys[j]}")
+            print(f"  s: {sanitized_slopes[j]}")
+            print(f"  c: {sanitized_intercepts[j]}")
+            print(f"  L: {sanitized_index_segments[j]}")
 
     weights = {}
     deadlines = {}
@@ -519,6 +541,7 @@ def plot_tikz_image_by_hull(x_start, x_end, s, c, indices, name, x_cap):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--log', '-l', default="warning")
+    parser.add_argument('--plot', '-p', action='store_true')
     args = parser.parse_args()
 
     if args.log == "critical":
@@ -535,5 +558,5 @@ if __name__ == "__main__":
         print(f"{args.log} is not an available log level. Available: critical, error, warning, info, debug")
         exit()
 
-    problem = parse_profiles_with_subsidiaries("output/040/040.hr.json", 2)
+    problem = parse_profiles_with_subsidiaries("output/040/040.hr.json", 1)
     parameters = problem.solve()
