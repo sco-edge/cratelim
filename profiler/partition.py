@@ -44,8 +44,8 @@ class Problem:
                                     [(j, k) for j in self.A for k in self.L_j[j]], cat=LpBinary)
 
         # objective function (7)
-        # problem += lpSum(self.w[i] * (z[i] + b[i, j]) for i in self.A_E for j in self.C[i])
-        problem += lpSum(self.w[i] * z[i] for i in self.A_E)
+        problem += lpSum(self.w[i] * (z[i] + b[i, j]) for i in self.A_E for j in self.C[i])
+        # problem += lpSum(self.w[i] * z[i] for i in self.A_E)
 
         # # constraint (8)
         # for i in self.A_E:
@@ -99,6 +99,11 @@ class Problem:
             for j in self.C[i]:
                 problem += lpSum(lambda_b[j, k] for k in self.L_j[j]) == 1
 
+        # constraints for b_{ij} > 0
+        for j in self.A:
+            for k in self.L_j[j]:
+                problem += b[i, j] >= epsilon
+
         problem.solve(GUROBI_CMD(options=[
             ("Presolve", 0),
             ("FeasibilityTol", 1e-9),
@@ -110,6 +115,8 @@ class Problem:
             print(f"z[i={i}] = {z[i].varValue}")
         for i in self.A_E:
             for j in self.A:
+                if b[i, j].varValue == 0:
+                    continue
                 print(f"b[i={i},j={j}] = {b[i, j].varValue}")
         for j in self.A:
             print(f"B[j={j}] = {B[j].varValue}")
@@ -131,28 +138,28 @@ class Problem:
                     continue
                 print(f"lambda[j={j},k={k}] = {lambda_b[j, k].varValue}")
         for i in self.A_E:
-            budgets = {}
+            partitions = {}
             for j in self.C[i]:
-                budget = 0
+                partition = 0
                 for k in self.L_j[j]:
-                    budget += (v[j, k].varValue + lambda_b[j, k].varValue * self.c_j_k[j][k]) / self.s_j_k[j][k]
-                budgets[j] = budget
+                    partition += (v[j, k].varValue + lambda_b[j, k].varValue * self.c_j_k[j][k]) / self.s_j_k[j][k]
+                partitions[j] = partition
 
             sum = 0
-            for budget in budgets.values():
-                sum += budget
-            print(f"budgets[i={i}] = {budgets}, {sum}")
+            for partition in partitions.values():
+                sum += partition
+            print(f"partitions[i={i}] = {partition}, {sum}")
 
         for constraint_name, constraint in problem.constraints.items():
             lhs_value = constraint.value()
             rhs_value = constraint.constant
 
-            if constraint.sense == -1:  # (LHS <= RHS)
-                slack = rhs_value - lhs_value
-            elif constraint.sense == 1:  # (LHS >= RHS)
-                slack = lhs_value - rhs_value
-            else:  # (LHS = RHS)
-                slack = abs(lhs_value - rhs_value)
+            # if constraint.sense == -1:  # (LHS <= RHS)
+            #     slack = rhs_value - lhs_value
+            # elif constraint.sense == 1:  # (LHS >= RHS)
+            #     slack = lhs_value - rhs_value
+            # else:  # (LHS = RHS)
+            #     slack = abs(lhs_value - rhs_value)
 
             # print(f"{constraint_name} {constraint} ({constraint.sense}): lhs = {lhs_value}, rhs = {rhs_value}, slack = {slack}")
             # if "10000" in f"{constraint}":
@@ -165,33 +172,33 @@ class Problem:
         return 
 
 def parse_profiles_with_subsidiaries(file_name, latency_slo):
-    # hr_call_chains = {
-    #     ("frontend", "frontend-hotels"):
-    #         [("frontend", "frontend-hotels"),
-    #          ("search", "search-near-by"),
-    #          ("geo", "geo-near-by"),
-    #          ("rate", "rate-get-rates"),
-    #          ("reservation", "reservation-check-availability"),
-    #          ("profile", "profile-get-profiles")],
-    #     ("frontend", "frontend-recommendations"):
-    #         [("frontend", "frontend-recommendations"),
-    #          ("recommendation", "recommendation-get-recommendations"),
-    #          ("profile", "profile-get-profiles")],
-    #     ("frontend", "frontend-user"):
-    #         [("frontend", "frontend-user"),
-    #          ("user", "user-check-user")],
-    #     ("frontend", "frontend-reservation"):
-    #         [("frontend", "frontend-reservation"),
-    #          ("user", "user-check-user"),
-    #          ("reservation", "reservation-make-reservation")]
-    # }
-
     hr_call_chains = {
         ("frontend", "frontend-hotels"):
-            [("geo", "geo-near-by")],
-        # ("frontend", "frontend-recommendations"):
-        #     [("user", "user-check-user")],
+            [("frontend", "frontend-hotels"),
+             ("search", "search-near-by"),
+             ("geo", "geo-near-by"),
+             ("rate", "rate-get-rates"),
+             ("reservation", "reservation-check-availability"),
+             ("profile", "profile-get-profiles")],
+        ("frontend", "frontend-recommendations"):
+            [("frontend", "frontend-recommendations"),
+             ("recommendation", "recommendation-get-recommendations"),
+             ("profile", "profile-get-profiles")],
+        ("frontend", "frontend-user"):
+            [("frontend", "frontend-user"),
+             ("user", "user-check-user")],
+        ("frontend", "frontend-reservation"):
+            [("frontend", "frontend-reservation"),
+             ("user", "user-check-user"),
+             ("reservation", "reservation-make-reservation")]
     }
+
+    # hr_call_chains = {
+    #     ("frontend", "frontend-hotels"):
+    #         [("geo", "geo-near-by")],
+    #     ("frontend", "frontend-recommendations"):
+    #         [("user", "user-check-user")],
+    # }
 
     # hr_call_chains = {
     #     ("frontend", "frontend-hotels"):
@@ -236,79 +243,83 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
                 y_full[i] = []
                 slopes_full[i] = []
                 intercepts_full[i] = []
+                
                 for segment in segments:
+                    slope, intercept, x_start, x_end = segment
+
                     # Skip the segments on the left of y-axis
-                    if segment[3] <= 0:
+                    if x_end <= 0:
                         continue
 
-                    # If the segment START's y-value is negative and END's y-value is positive, it
-                    # is the first meaningful segment. Otherwise, (1) both START and END are less
-                    # than zero or (2) both START and END are larger than zero
-                    if segment[0] * segment[2] - segment[1] < 0:
-                        if segment[0] * segment[3] - segment[1] > 0:
+                    start_y = slope * x_start - intercept
+                    end_y = slope * x_end - intercept
+
+                    # If the segment x-START's y-value is negative and x-END's y-value is positive,
+                    # it is the first meaningful segment. Otherwise,
+                    # (1) both x-START and x-END are leq to zero or
+                    # (2) both x-START and x-END are geq to zero
+                    if start_y < 0:
+                        if end_y > 0:
                             y_full[i].append(0)
                         else:
-                            # Both are less than zero. Skip it.
                             continue
                     else:
-                        if math.isinf(segment[0] * segment[2] - segment[1]):
+                        if math.isinf(start_y):
                             y_full[i].append(1e308)
                         else:
-                            y_full[i].append(segment[0] * segment[2] - segment[1])
+                            y_full[i].append(start_y)
 
-                    slopes_full[i].append(segment[0])
-                    intercepts_full[i].append(segment[1])
+                    slopes_full[i].append(slope)
+                    intercepts_full[i].append(intercept)
 
-                    # If the segment END infinite, break
-                    if segment[3] == float('inf'):
+                    # If the segment x-END is inf, break
+                    if x_end == float('inf'):
                         # if math.isinf(segment[0] * latency_slo - segment[1]):
                         #     y_full[i].append(1e308)
                         # else:
                         #     y_full[i].append(segment[0] * latency_slo - segment[1])
                         break
 
-            # Gather all breakpoints from every span
-            y_for_ms = sorted(set(value for values in y_full.values() for value in values))
-            slopes_for_ms = {}
-            intercepts_for_ms = {}
-            for k, bp in enumerate(y_for_ms):
-                segments_to_add = [0 for _ in range(len(y_full))]
-                for i in range(len(y_full)):
-                    segment_index = segments_to_add[i]
+            # Merge sub-service curves
+            merged_y = sorted(set(value for values in y_full.values() for value in values))
+            merged_slopes = {}
+            merged_intercepts = {}
+            for k, bp in enumerate(merged_y):
+                num_spans = len(y_full)
+                segment_indices_to_add = [0 for _ in range(num_spans)]
+                for i in range(num_spans):
+                    # Start at index 0, find the segment in i-th span that contains this breakpoint
+                    segment_index = segment_indices_to_add[i]
                     while True:
                         if segment_index + 1 >= len(y_full[i]):
                             break
 
-                        if bp >= y_full[i][segment_index + 1]:
+                        if bp >= y_full[i][segment_index+1]:
                             segment_index += 1
                         else:
                             break
-                    segments_to_add[i] = segment_index
+                    segment_indices_to_add[i] = segment_index
 
-                if len(segments_to_add) == 0:
-                    continue
-
+                # Calculate the slope (M) and intercept (C) of the merged curve
+                # M is 1/(1/s_1 + 1/s_2 + ...) (the harmonic mean of slopes)
+                # C is M * (c_1/s_1 + c_2/s_2 + ...)
                 slope_inverse_sum = 0
                 frac_intercept_sum = 0
-                for i, index in enumerate(segments_to_add):
-                    if index >= len(slopes_full[i]) and index >= len(intercepts_full[i]):
-                        slope_inverse_sum += 1 / slopes_full[i][index-1]
-                        frac_intercept_sum += intercepts_full[i][index-1] / slopes_full[i][index-1]
-                    else:
-                        slope_inverse_sum += 1 / slopes_full[i][index]
-                        frac_intercept_sum += intercepts_full[i][index] / slopes_full[i][index]
-                slopes_for_ms[k] = 1 / slope_inverse_sum
-                intercepts_for_ms[k] = slopes_for_ms[k] * frac_intercept_sum
-            y_for_ms.append(1e308)
+                for i, index in enumerate(segment_indices_to_add):
+                    slope_inverse_sum += 1 / slopes_full[i][index]
+                    frac_intercept_sum += intercepts_full[i][index] / slopes_full[i][index]
+                merged_slopes[k] = 1 / slope_inverse_sum
+                merged_intercepts[k] = merged_slopes[k] * frac_intercept_sum
+            merged_y.append(1e308)
 
-            print(f'{profile["microservice"]}-{profile["api"]} bp: {y_for_ms}')
-            print(f'{profile["microservice"]}-{profile["api"]} ss: {slopes_for_ms}')
-            print(f'{profile["microservice"]}-{profile["api"]} cs: {intercepts_for_ms}')
+            # print(f'{profile["microservice"]}-{profile["api"]} bp: {merged_y}')
+            # print(f'{profile["microservice"]}-{profile["api"]} ss: {merged_slopes}')
+            # print(f'{profile["microservice"]}-{profile["api"]} cs: {merged_intercepts}')
 
-            ys[j] = y_for_ms
-            slopes[j] = slopes_for_ms
-            intercepts[j] = intercepts_for_ms
-            index_segments[j] = range(len(y_for_ms) - 1)
+            ys[j] = merged_y
+            slopes[j] = merged_slopes
+            intercepts[j] = merged_intercepts
+            index_segments[j] = range(len(merged_y) - 1)
 
         chains = {}
         for m1, a1 in hr_call_chains:
@@ -326,64 +337,62 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
         print("apis:", apis)
         print("metadata_apis:", metadata_apis)
         print("chains:", chains)
-        # for j in range(len(index_segments)):
-        #     print(f"{metadata_apis_inverse[j]} {j}")
-        #     print(f"  y: {ys[j]}")
-        #     print(f"  s: {slopes[j]}")
-        #     print(f"  c: {intercepts[j]}")
-        #     print(f"  L: {index_segments[j]}")
         
         for name in metadata_apis:
-            j = metadata_apis[name]
-            xs = []
-            for k in index_segments[j]:
-                x = (ys[j][k] + intercepts[j][k]) / slopes[j][k]
-                print(name, j, k, x, ys[j][k])
-                if x >= latency_slo:
-                    break
-                xs.append(x)
-            
-            x_start = []
-            x_end = []
-            for k, x in enumerate(xs):
-                x_start.append(x)
-                if k == 0:
-                    continue
-                x_end.append(x)
-            x_end.append(latency_slo)
-
-            if args.plot:
-                plot_tikz_image_by_hull(x_start, x_end, slopes[j], intercepts[j], index_segments[j], f"int.{name}", latency_slo)
-
             sanitized_y = []
             sanitized_slope = {}
             sanitized_intercept = {}
-            for k, x in enumerate(xs):
+
+            j = metadata_apis[name]
+            xs = []
+            truncated = False
+            # print(f"{name} ({j}):")
+            for k in index_segments[j]:
+                x = (ys[j][k] + intercepts[j][k]) / slopes[j][k]
+                # print(f"  k={k} x={x} y={ys[j][k]} s={slopes[j][k]} c={intercepts[j][k]}")
+                if x > latency_slo:
+                    truncated = True
+                    break
+                xs.append(x)
                 sanitized_y.append(ys[j][k])
                 sanitized_slope[k] = slopes[j][k]
                 sanitized_intercept[k] = intercepts[j][k]
 
+            xs.append(latency_slo)
+            if truncated:
+                sanitized_y.append(slopes[j][k-1] * latency_slo - intercepts[j][k-1])
+                print(f"{slopes[j][k-1] * latency_slo - intercepts[j][k-1]} = {slopes[j][k-1]} * {latency_slo} - {intercepts[j][k-1]}")
+            else:
+                sanitized_y.append(slopes[j][k] * latency_slo - intercepts[j][k])
+                print(f"{slopes[j][k] * latency_slo - intercepts[j][k]} = {slopes[j][k]} * {latency_slo} - {intercepts[j][k]}")
+            
             sanitized_ys[j] = sanitized_y
             sanitized_slopes[j] = sanitized_slope
             sanitized_intercepts[j] = sanitized_intercept
-            sanitized_index_segments[j] = range(k)
-            
+            sanitized_index_segments[j] = range(len(sanitized_y) - 1)
             print(f"{metadata_apis_inverse[j]} {j}")
+            print(f"  x: {xs}")
             print(f"  y: {sanitized_ys[j]}")
             print(f"  s: {sanitized_slopes[j]}")
             print(f"  c: {sanitized_intercepts[j]}")
             print(f"  L: {sanitized_index_segments[j]}")
+            
+            if args.plot:
+                x_start = []
+                x_end = []
+                for k in sanitized_index_segments[j]:
+                    x_start.append(xs[k])
+                    x_end.append(xs[k+1])
+                plot_tikz_image_by_hull(x_start, x_end, slopes[j], intercepts[j], index_segments[j], f"int.{name}", latency_slo)
 
     weights = {}
     deadlines = {}
     for external_api in external_apis:
-        weights[external_api] = 1/len(external_apis)
+        weights[external_api] = 1 / len(external_apis)
         deadlines[external_api] = latency_slo
 
     return Problem(external_apis, apis, chains, sanitized_index_segments, sanitized_ys, sanitized_slopes, sanitized_intercepts,
                    weights, deadlines)
-    # return Problem(external_apis, apis, chains, index_segments, ys, slopes, intercepts,
-    #                weights, deadlines)
 
 def parse_profiles(file_name, latency_slo):
     hr_call_chains = {
