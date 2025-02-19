@@ -99,56 +99,63 @@ class Problem:
             for j in self.C[i]:
                 problem += lpSum(lambda_b[j, k] for k in self.L_j[j]) == 1
 
-        # constraints for b_{ij} > 0
-        for j in self.A:
-            for k in self.L_j[j]:
-                problem += b[i, j] >= epsilon
+        # Additional constraint: stability of token buckets 
+        for i in self.A_E:
+            for j in self.C[i]:
+                problem += b[i, j] >= lpSum(self.s_j_k[j][k] * delta_b[i, j, k] * 1/20 for k in self.L_j[j])
 
         problem.solve(GUROBI_CMD(options=[
             ("Presolve", 0),
             ("FeasibilityTol", 1e-9),
             ("IntFeasTol", 1e-9),("MIPGap", 1e-9), ("TimeLimit", 600)]))
         print("Solver Status:", LpStatus[problem.status])
+        if LpStatus[problem.status] == "Not Solved":
+            return
 
         print(f"Objective Value = {problem.objective.value()}")
+        # for j in self.A:
+        #     for k in self.L_j[j]:
+        #         if v[j, k].varValue == 0:
+        #             continue
+        #         print(f"v[j={j},k={k}] = {v[j, k].varValue} c[j={j},k={k}] = {self.c_j_k[j][k]}")
+        
+        budgets_per_eapi = {}
         for i in self.A_E:
-            print(f"z[i={i}] = {z[i].varValue}")
-        for i in self.A_E:
-            for j in self.A:
-                if b[i, j].varValue == 0:
-                    continue
-                print(f"b[i={i},j={j}] = {b[i, j].varValue}")
-        for j in self.A:
-            print(f"B[j={j}] = {B[j].varValue}")
-        for j in self.A:
-            for k in self.L_j[j]:
-                if v[j, k].varValue == 0:
-                    continue
-                print(f"v[j={j},k={k}] = {v[j, k].varValue} c[j={j},k={k}] = {self.c_j_k[j][k]}")
+            budgets = {}
+            for j in self.C[i]:
+                budget = 0
+                for k in self.L_j[j]:
+                    budget += (v[j, k].varValue + lambda_b[j, k].varValue * self.c_j_k[j][k]) / self.s_j_k[j][k]
+                budgets[j] = budget
+
+            # print(f"budget[i={i:2}]")
+            # sum = 0
+            # for j, budget in budgets.items():
+            #     print(f"  {j:2} = {budget:.3f}")
+            #     sum += budget
+            # print(f" sum = {sum:.3f}")
+            budgets_per_eapi[i] = budgets
+
         for i in self.A_E:
             # for j in self.A:
             for j in self.C[i]:
                 for k in self.L_j[j]:
-                    if delta_b[i, j, k].varValue == 0:
+                    if delta_b[i, j, k].varValue <= 1e-4:
                         continue
-                    print(f"delta[i={i},j={j},k={k}] = {delta_b[i, j, k].varValue}")
-        for j in self.A:
-            for k in self.L_j[j]:
-                if lambda_b[j, k].varValue == 0:
-                    continue
-                print(f"lambda[j={j},k={k}] = {lambda_b[j, k].varValue}")
-        for i in self.A_E:
-            partitions = {}
-            for j in self.C[i]:
-                partition = 0
-                for k in self.L_j[j]:
-                    partition += (v[j, k].varValue + lambda_b[j, k].varValue * self.c_j_k[j][k]) / self.s_j_k[j][k]
-                partitions[j] = partition
+                    print(f"delta[i={i:2},j={j:2},k={k:2}]",
+                          f"s[j={j:2}][k={k:2}] = {self.s_j_k[j][k]:8.3f}",
+                          f"b[i={i:2},j={j:2}] = {b[i, j].varValue:8.3f}",
+                          f"B[j={j:2}] = {B[j].varValue:8.3f}",
+                          f"z[i={i:2}] = {z[i].varValue:8.3f}",
+                          f"budgets[i={i:2},j={j:2}] = {budgets_per_eapi[i][j]:.3f}")
+            print(f"D[i={i:2}] = {self.D[i]} sum_partitions = {sum(budgets_per_eapi[i].values()):.3f}")
+                    
+        # for j in self.A:
+        #     for k in self.L_j[j]:
+        #         if lambda_b[j, k].varValue == 0:
+        #             continue
+        #         print(f"lambda[j={j},k={k}] = {lambda_b[j, k].varValue}")
 
-            sum = 0
-            for partition in partitions.values():
-                sum += partition
-            print(f"partitions[i={i}] = {partition}, {sum}")
 
         for constraint_name, constraint in problem.constraints.items():
             lhs_value = constraint.value()
@@ -164,26 +171,50 @@ class Problem:
             # print(f"{constraint_name} {constraint} ({constraint.sense}): lhs = {lhs_value}, rhs = {rhs_value}, slack = {slack}")
             # if "10000" in f"{constraint}":
             #     continue
-            slack = -lhs_value if constraint.sense == -1 else lhs_value
-            print(f"{constraint_name} {constraint} ({constraint.sense}) lhs: {lhs_value} slack: {slack}")
+            # slack = -lhs_value if constraint.sense == -1 else lhs_value
+            # print(f"{constraint_name} {constraint} ({constraint.sense}) lhs: {lhs_value} slack: {slack}")
 
             # if abs(slack) < 1e-6:
             #     print(f"  🔥 Constraint {constraint_name} is Tight! (slack = {slack})")
         return 
 
-def parse_profiles_with_subsidiaries(file_name, latency_slo):
+def parse_profiles_with_subsidiaries(file_name, latency_slos):
+    max_latency_slo = np.max(latency_slos)
+    # hr_call_chains = {
+    #     ("frontend", "frontend-hotels"):
+    #         [("frontend", "frontend-hotels"),
+    #          ("search", "search-near-by"),
+    #          ("geo", "geo-near-by"),
+    #          ("rate", "rate-get-rates"),
+    #          ("reservation", "reservation-check-availability"),
+    #          ("profile", "profile-get-profiles")],
+    #     ("frontend", "frontend-recommendations"):
+    #         [("frontend", "frontend-recommendations"),
+    #          ("recommendation", "recommendation-get-recommendations"),
+    #          ("profile", "profile-get-profiles")],
+    #     ("frontend", "frontend-user"):
+    #         [("frontend", "frontend-user"),
+    #          ("user", "user-check-user")],
+    #     ("frontend", "frontend-reservation"):
+    #         [("frontend", "frontend-reservation"),
+    #          ("user", "user-check-user"),
+    #          ("reservation", "reservation-make-reservation")]
+    # }
+
     hr_call_chains = {
         ("frontend", "frontend-hotels"):
-            [("frontend", "frontend-hotels"),
-             ("search", "search-near-by"),
-             ("geo", "geo-near-by"),
+            [("geo", "geo-near-by"),
              ("rate", "rate-get-rates"),
              ("reservation", "reservation-check-availability"),
-             ("profile", "profile-get-profiles")],
+             ("profile", "profile-get-profiles"),
+             ("user", "user-check-user")],
         ("frontend", "frontend-recommendations"):
             [("frontend", "frontend-recommendations"),
+             ("geo", "geo-near-by"),
              ("recommendation", "recommendation-get-recommendations"),
-             ("profile", "profile-get-profiles")],
+             ("reservation", "reservation-check-availability"),
+             ("profile", "profile-get-profiles"),
+             ("user", "user-check-user")],
         ("frontend", "frontend-user"):
             [("frontend", "frontend-user"),
              ("user", "user-check-user")],
@@ -193,18 +224,6 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
              ("reservation", "reservation-make-reservation")]
     }
 
-    # hr_call_chains = {
-    #     ("frontend", "frontend-hotels"):
-    #         [("geo", "geo-near-by")],
-    #     ("frontend", "frontend-recommendations"):
-    #         [("user", "user-check-user")],
-    # }
-
-    # hr_call_chains = {
-    #     ("frontend", "frontend-hotels"):
-    #         [("rate", "rate-get-rates"),
-    #          ("geo", "geo-near-by")]
-    # }
 
     with open(file_name, "r") as file:
         profiles = json.load(file)
@@ -350,7 +369,7 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
             for k in index_segments[j]:
                 x = (ys[j][k] + intercepts[j][k]) / slopes[j][k]
                 # print(f"  k={k} x={x} y={ys[j][k]} s={slopes[j][k]} c={intercepts[j][k]}")
-                if x > latency_slo:
+                if x >= max_latency_slo:
                     truncated = True
                     break
                 xs.append(x)
@@ -358,13 +377,13 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
                 sanitized_slope[k] = slopes[j][k]
                 sanitized_intercept[k] = intercepts[j][k]
 
-            xs.append(latency_slo)
+            xs.append(max_latency_slo)
             if truncated:
-                sanitized_y.append(slopes[j][k-1] * latency_slo - intercepts[j][k-1])
-                print(f"{slopes[j][k-1] * latency_slo - intercepts[j][k-1]} = {slopes[j][k-1]} * {latency_slo} - {intercepts[j][k-1]}")
+                sanitized_y.append(slopes[j][k-1] * max_latency_slo - intercepts[j][k-1])
+                print(f"{slopes[j][k-1] * max_latency_slo - intercepts[j][k-1]} = {slopes[j][k-1]} * {max_latency_slo} - {intercepts[j][k-1]}")
             else:
-                sanitized_y.append(slopes[j][k] * latency_slo - intercepts[j][k])
-                print(f"{slopes[j][k] * latency_slo - intercepts[j][k]} = {slopes[j][k]} * {latency_slo} - {intercepts[j][k]}")
+                sanitized_y.append(slopes[j][k] * max_latency_slo - intercepts[j][k])
+                print(f"{slopes[j][k] * max_latency_slo - intercepts[j][k]} = {slopes[j][k]} * {max_latency_slo} - {intercepts[j][k]}")
             
             sanitized_ys[j] = sanitized_y
             sanitized_slopes[j] = sanitized_slope
@@ -383,124 +402,16 @@ def parse_profiles_with_subsidiaries(file_name, latency_slo):
                 for k in sanitized_index_segments[j]:
                     x_start.append(xs[k])
                     x_end.append(xs[k+1])
-                plot_tikz_image_by_hull(x_start, x_end, slopes[j], intercepts[j], index_segments[j], f"int.{name}", latency_slo)
+                plot_tikz_image_by_hull(x_start, x_end, slopes[j], intercepts[j], index_segments[j], f"int.{name}", max_latency_slo)
 
     weights = {}
     deadlines = {}
-    for external_api in external_apis:
+    for i, external_api in enumerate(external_apis):
         weights[external_api] = 1 / len(external_apis)
-        deadlines[external_api] = latency_slo
+        deadlines[external_api] = latency_slos[i]
 
     return Problem(external_apis, apis, chains, sanitized_index_segments, sanitized_ys, sanitized_slopes, sanitized_intercepts,
                    weights, deadlines)
-
-def parse_profiles(file_name, latency_slo):
-    hr_call_chains = {
-        ("frontend", "frontend-hotels"):
-            [("search", "search-near-by"),
-             ("geo", "geo-near-by"),
-             ("rate", "rate-get-rates"),
-             ("reservation", "reservation-check-availability"),
-             ("profile", "profile-get-profiles")],
-        ("frontend", "frontend-recommendations"):
-            [("recommendation", "recommendation-get-recommendations"),
-            ("profile", "profile-get-profiles")],
-        ("frontend", "frontend-user"):
-            [("user", "user-check-user")],
-        ("frontend", "frontend-reservation"):
-            [("user", "user-check-user"),
-             ("reservation", "reservation-make-reservation")]
-    }
-
-    with open(file_name, "r") as file:
-        profiles = json.load(file)
-
-        # A_E and A
-        external_apis = []
-        metadata_external_apis = {}
-        apis = []
-        metadata_apis = {}
-
-        # b_j_k, s_j_k, c_j_k, L_j
-        y_intersections = {}
-        slopes = {}
-        intercepts = {}
-        index_segments = {}
-        
-        j = 0
-        for profile in profiles:
-            for i in range(len(profile["segments_per_api"]) - 1):
-                print(f'{profile["microservice"]}-{profile["api"]}-{i}')
-                if profile["microservice"] == "frontend" and i == 0:
-                    external_apis.append(j)
-                    metadata_external_apis[f'{profile["microservice"]}-{profile["api"]}-{i}'] = j
-
-                apis.append(j)
-                metadata_apis[f'{profile["microservice"]}-{profile["api"]}-{i}'] = j
-                # index_segments[j] = list(range(len(profile["segments_per_api"][i+1])))
-
-                y_intersections[j] = []
-                slopes[j] = []
-                intercepts[j] = []
-
-                for segment in profile["segments_per_api"][i+1]:
-                    if segment[3] <= 0:
-                        continue
-
-                    if segment[0] * segment[2] - segment[1] < 0:
-                        if segment[0] * segment[3] - segment[1] > 0:
-                            y_intersections[j].append(0)
-                        else:
-                            continue
-                    else:
-                        if math.isinf(segment[0] * segment[2] - segment[1]):
-                            y_intersections[j].append(1e308)
-                        else:
-                            y_intersections[j].append(segment[0] * segment[2] - segment[1])
-
-                    slopes[j].append(segment[0])
-                    intercepts[j].append(segment[1])
-
-                    if segment[3] > latency_slo:
-                        if math.isinf(segment[0] * segment[3] - segment[1]):
-                            y_intersections[j].append(1e308)
-                        else:
-                            y_intersections[j].append(segment[0] * segment[3] - segment[1])
-                        break
-                        
-                index_segments[j] = list(range(len(slopes[j])))
-                j += 1
-
-        chains = {}
-        for m1, a1 in hr_call_chains:
-            external_api = f"{m1}-{a1}-0"
-            chain = hr_call_chains[(m1, a1)]
-
-            external_api_index = metadata_external_apis[external_api]
-            for m2, a2 in chain:
-                i = 0
-                chain_indices = []
-                while f"{m2}-{a2}-{i}" in metadata_apis:
-                    chain_indices.append(metadata_apis[f"{m2}-{a2}-{i}"])
-                    i += 1
-            chains[external_api_index] = chain_indices
-
-
-        print("external_apis:", external_apis)
-        print("metadata_external_apis:", metadata_external_apis)
-        print("apis:", apis)
-        print("metadata_apis:", metadata_apis)
-        print("chains:", chains)
-        for j in range(len(index_segments)):
-            print(f"{j}  y: {y_intersections[j]} s: {slopes[j]} c: {intercepts[j]} L: {index_segments[j]}")
-        
-    weights = {}
-    deadlines = {}
-    for external_api in external_apis:
-        weights[external_api] = 1/len(external_apis)
-        deadlines[external_api] = latency_slo
-
-    return Problem(external_apis, apis, chains, index_segments, y_intersections, slopes, intercepts, weights, deadlines)
 
 def plot_tikz_image_by_hull(x_start, x_end, s, c, indices, name, x_cap):
     tikz_code = """
@@ -567,5 +478,6 @@ if __name__ == "__main__":
         print(f"{args.log} is not an available log level. Available: critical, error, warning, info, debug")
         exit()
 
-    problem = parse_profiles_with_subsidiaries("output/040/040.hr.json", 1)
+    latency_slos = [0.6, 1, 1.9, 1.5]
+    problem = parse_profiles_with_subsidiaries("output/040/040.hr.json", latency_slos)
     parameters = problem.solve()
