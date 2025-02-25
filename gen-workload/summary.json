@@ -1,0 +1,66 @@
+{
+  "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod5cf394bb_742a_4ecf_9362_25e4abffd9de.slice/cri-containerd-f98df867efe1260e30a6b0ae762819363e7704573e4c4e4370f455a8038431af.scope": {
+    "timestamp": "2025-01-27T12:01:58.21492922Z",
+    "latest_usage": {
+      "cpu": 1,
+      "memory": 34848768
+    },
+    "minute_usage": {
+      "percent_complete": 100,
+      "cpu": {
+        "present": true,
+        "mean": 0,
+        "max": 0,
+        "fifty": 0,
+        "ninety": 0,
+        "ninetyfive": 0
+      },
+      "memory": {
+        "present": true,
+        "mean": 33731085,
+        "max": 33857536,
+        "fifty": 33726464,
+        "ninety": 33730560,
+        "ninetyfive": 33730560
+      }
+    },
+    "hour_usage": {
+      "percent_complete": 100,
+      "cpu": {
+        "present": true,
+        "mean": 0,
+        "max": 17,
+        "fifty": 0,
+        "ninety": 0,
+        "ninetyfive": 0
+      },
+      "memory": {
+        "present": true,
+        "mean": 33948708,
+        "max": 35618816,
+        "fifty": 34009088,
+        "ninety": 34176204,
+        "ninetyfive": 34213007
+      }
+    },
+    "day_usage": {
+      "percent_complete": 4,
+      "cpu": {
+        "present": true,
+        "mean": 0,
+        "max": 17,
+        "fifty": 0,
+        "ninety": 0,
+        "ninetyfive": 0
+      },
+      "memory": {
+        "present": true,
+        "mean": 33948708,
+        "max": 35618816,
+        "fifty": 34009088,
+        "ninety": 34176204,
+        "ninetyfive": 34213007
+      }
+    }
+  }
+}
