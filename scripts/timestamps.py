@@ -1,20 +1,40 @@
 #!/usr/bin/python3
 import os
 import re
+import sys
 import time
 import json
+import signal
 import logging
 import datetime
 import argparse
 import subprocess
 import numpy as np
 
+models = {"closed", "constant", "bursty", "random"}
+
+def bg_port_forward():
+    bg_processes = []
+    bg_processes.append(subprocess.Popen(
+        ["kubectl", "port-forward", "-n", "loki", "svc/loki", "3100:3100"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ))
+    bg_processes.append(subprocess.Popen(
+        ["kubectl", "port-forward", "svc/hr-gateway-istio", "8080:80"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)
+    ))
+
+    return bg_processes
+
 def enable_lua_logging(microservice):
     try:
         logging.info("enable_lua_logging(): fetching all pods.")
         max_retries = 5
         retries = 0
-
         while retries < max_retries:
             cmd = ["kubectl", "get", "pods", "-A"]
             result = subprocess.run(cmd, check=True, text=True, capture_output=True)
@@ -44,8 +64,6 @@ def enable_lua_logging(microservice):
 
 def parse_loki_log(rate, duration, microservice, api, arrivals, departures, range_from, range_to):
     data = []
-    backlogs = [0] * (len(arrivals) + 1)
-    max_backlogs = [0] * (len(arrivals) + 1)
     start_timestamp = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
     end_timestamp = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
@@ -83,8 +101,18 @@ def parse_loki_log(rate, duration, microservice, api, arrivals, departures, rang
                 for line in log_file:
                     match = re.match(pattern, line)
                     if match:
-                        timestamp, interval_measured = calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, match.groupdict())
+                        timestamp = None
+                        parsed_line = match.groupdict()
+                        for i, condition in enumerate(arrivals):
+                            if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
+                                timestamp = datetime.datetime.fromisoformat(parsed_line['second_timestamp'].replace("Z", "+00:00"))
+                                data.append(timestamp)
 
+                                if parsed_line['direction'] == 'I' and parsed_line['type'] == 'REQ' and parsed_line['progress_context'] == 'no-progress':
+                                    interval_measured = True
+                        
+                        if not timestamp:
+                            continue
                         if start_timestamp > timestamp:
                             start_timestamp = timestamp
                         if end_timestamp < timestamp:
@@ -106,35 +134,12 @@ def parse_loki_log(rate, duration, microservice, api, arrivals, departures, rang
             for i in range(1, len(measured_timestamps)):
                 interval = (measured_timestamps[i] - measured_timestamps[i-1]).total_seconds()
                 intervals.append(interval)
-            print(np.average(intervals), np.std(intervals), 1/rate)
-            return max_backlogs, np.average(intervals)
+            return data
         logging.error("parse_loki_log() has no measured timestamps")
 
     except subprocess.CalledProcessError as e:
         logging.error(e.stderr)
 
-def calculate_backlog(arrivals, departures, data, backlogs, max_backlogs, parsed_line):
-    interval_measured = False
-    for i, condition in enumerate(arrivals):
-        if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
-            backlogs[0] += 1
-            backlogs[i+1] += 1
-            data.append((parsed_line['second_timestamp'], tuple(backlogs)))
-            if backlogs[i+1] > max_backlogs[i+1]:
-                max_backlogs[i+1] = backlogs[i+1]
-            if backlogs[0] > max_backlogs[0]:
-                max_backlogs[0] = backlogs[0]
-
-            if parsed_line['direction'] == 'I' and parsed_line['type'] == 'REQ' and parsed_line['progress_context'] == 'no-progress':
-                interval_measured = True
-            
-    for i, condition in enumerate(departures):
-        if (parsed_line['direction'], parsed_line['type'], parsed_line['progress_context']) == condition:
-            backlogs[0] -= 1
-            backlogs[i+1] -= 1
-            data.append((parsed_line['second_timestamp'], tuple(backlogs)))
-
-    return datetime.datetime.fromisoformat(parsed_line['second_timestamp'].replace("Z", "+00:00")), interval_measured
 def clear_envoyfilter():
     try:
         logging.info(f"Clear envoyfilters")
@@ -304,28 +309,59 @@ spec:
         except subprocess.CalledProcessError as e:
             logging.error(e.stderr)
 
+def run(model, trace):
+    if model == "closed":
+        try:
+            cmd = ["locust", '--headless', '-f=closed-hr.py', '-H=http://localhost:8080', f'--log={args.log}', f'--trace={trace}']
+            logging.info(" ".join(cmd))
+            subprocess.run(cmd, text=True, capture_output=True, check=True, cwd=workload_gen_cwd)
+        except subprocess.CalledProcessError as e:
+            logging.error(e.stderr)
+
+    elif model == "constant":
+        try:
+            cmd = ["constant-hr.py", f'--log={args.log}', f'--trace={trace}']
+            logging.info(" ".join(cmd))
+            result = subprocess.run(cmd, text=True, capture_output=True, check=True, cwd=workload_gen_cwd)
+        except subprocess.CalledProcessError as e:
+            logging.error(e.stderr)
+
+    elif model == "bursty":
+        try:
+            cmd = ["bursty-hr.py"]
+            logging.info(" ".join(cmd))
+            subprocess.run(cmd, text=True, capture_output=True, check=True, cwd=workload_gen_cwd)
+        except subprocess.CalledProcessError as e:
+            logging.error(e.stderr)
+
+
 if __name__ == "__main__":
     script_cwd = os.getcwd()
     profiler_cwd = os.path.join(script_cwd, "../profiler")
+    workload_gen_cwd = os.path.join(script_cwd, "../gen-workload")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('app')
-    parser.add_argument('--log', '-l', default="warning")
+    parser.add_argument('--app', '-a', default="hr")
+    parser.add_argument('--model', '-m', default="closed", help="closed|constant|bursty|random")
+    parser.add_argument('--trace', '-t', default="bursty-short")
+    parser.add_argument('--log', '-l', default="warning", help="critical|error|warning|info|debug")
     args = parser.parse_args()
 
-    if args.log == "critical":
-        logging.basicConfig(level=logging.CRITICAL)
-    elif args.log == "error":
-        logging.basicConfig(level=logging.ERROR)
-    elif args.log == "warning":
-        logging.basicConfig(level=logging.WARNING)
-    elif args.log == "info":
-        logging.basicConfig(level=logging.INFO)
-    elif args.log == "debug":
-        logging.basicConfig(level=logging.DEBUG)
-    else:
+    if not args.model in models:
+        print(f"{args.model} is not an available model. Available: closed, constant, bursty, random")
+        sys.exit(1)
+    model = args.model
+    
+    if not os.path.exists(os.path.join(workload_gen_cwd, f"traces/{args.trace}.txt")):
+        print(f"{args.trace} is not an available trace. Check {workload_gen_cwd}/traces directory.")
+        sys.exit(1)
+    trace = args.trace
+
+    log_level = getattr(logging, args.log.upper(), None)
+    if log_level is None:
         print(f"{args.log} is not an available log level. Available: critical, error, warning, info, debug")
-        exit()
+        sys.exit(1)
+    logging.basicConfig(level=log_level)
 
     rate = 10
     duration = 2000
@@ -335,13 +371,34 @@ if __name__ == "__main__":
     arrivals = []
     departures = []
     arrivals.append(('I', 'REQ', 'no-progress'))
-    
-    clear_envoyfilter()
-    apply_envoyfilter(args.app, microservice, api)
-    enable_lua_logging(microservice)
-    range_from = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-    time.sleep(5)
 
-    range_to = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-    parse_loki_log(rate, duration, microservice, api, arrivals, departures, range_from, range_to)
-    clear_envoyfilter()
+    try:
+        apply_envoyfilter(args.app, microservice, api)
+        enable_lua_logging(microservice)
+        bg_processes = bg_port_forward()
+        time.sleep(0.5)
+        range_from = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        run(model, trace)
+        range_to = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+        data = parse_loki_log(rate, duration, microservice, api, arrivals, departures, range_from, range_to)
+    finally:
+        clear_envoyfilter()
+        if bg_processes:
+            for bg_process in bg_processes:
+                bg_process.terminate()
+                bg_process.wait()
+
+    if data:
+        with open(f"{model}.{trace}.server.log", "w") as timestamp_file:
+            for timestamp in data:
+                timestamp_file.write(str(timestamp) + '\n')
+    else:
+        logging.error("No server-side data to write.")
+
+    with open(f"{model}.{trace}.client.log", 'w') as client_file, open(os.path.join(workload_gen_cwd, f"{model}.log")) as file:
+        for line in file:
+            response = json.loads(line.strip())
+            line = f'{response["time"]} {response["latency"]} {response["response_code"]}\n'
+            client_file.write(line)
+
+            
