@@ -127,7 +127,8 @@ class SocialMediaUser(FastHttpUser):
             context={'type': 'user_login'})
 
 
-RPS = list(map(int, Path('rps.txt').read_text().splitlines()))
+# RPS = list(map(int, Path('rps.txt').read_text().splitlines()))
+RPS = list(map(int, Path('traces/30.txt').read_text().splitlines()))
 
 
 class CustomShape(LoadTestShape):
